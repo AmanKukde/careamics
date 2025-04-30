@@ -34,7 +34,7 @@ repos:
         args: ["--config-file", "mypy.ini"]
         additional_dependencies:
           - numpy<2.0.0
-          - pydantic
+          - pydantic==2.10.6
           - types-PyYAML
           - types-setuptools
 
