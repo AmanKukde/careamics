@@ -105,7 +105,9 @@ class DatasetConfig(BaseModel):
     multiscale_lowres_count: Optional[int] = None
     """Number of LC scales"""
 
-    tiling_mode: Optional[TilingMode] = TilingMode.ShiftBoundary
+    # tiling_mode: Optional[TilingMode] = TilingMode.ShiftBoundary
+    tiling_mode: Optional[TilingMode] = TilingMode.WindowedTiling
+
 
     target_separate_normalization: Optional[bool] = True
 

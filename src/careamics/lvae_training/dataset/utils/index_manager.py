@@ -111,8 +111,8 @@ class GridIndexManager:
                     0, np.floor((coordinate - excess_size) / self.grid_shape[dim])
                 )
 
-        else:
-            raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
+        # else:
+        #     raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
 
     def dataset_idx_from_grid_idx(self, grid_idx: tuple):
         """
@@ -133,15 +133,49 @@ class GridIndexManager:
         grid_location = self.get_location_from_dataset_idx(dataset_idx)
         offset = self.patch_offset()
         return tuple(np.array(grid_location) - np.array(offset))
-
-    def get_dataset_idx_from_grid_location(self, location: tuple):
-        assert len(location) == len(
-            self.data_shape
-        ), f"Location {location} must have the same dimension as data shape {self.data_shape}"
-        grid_idx = [
-            self.get_grid_index(dim, location[dim]) for dim in range(len(location))
-        ]
-        return self.dataset_idx_from_grid_idx(tuple(grid_idx))
+    
+    def get_dataset_idx_from_grid_location(self, location: tuple) -> int:
+        """
+        Overrides for reverse lookup for WindowedTiling using fixed stride.
+        Converts a full N, [Z], H, W, C patch location tuple back to a flat dataset index.
+        """
+        if self.tiling_mode == TilingMode.WindowedTiling:
+            # Ensure the length of the input 'location' tuple matches the expected data dimensions.
+            # Using self._data_shape which is correctly set up in __post_init__
+            if len(location) != len(self._data_shape):
+                raise ValueError(f"Location tuple length {len(location)} "
+                                 f"must match data_shape length {len(self._data_shape)}.")
+            
+            grid_idx = []
+            
+            # Iterate through each dimension (N, [Z], H, W, C) using its original index.
+            # The loop variable 'dim_original_idx' directly corresponds to the dimension's position.
+            for dim_original_idx in range(len(self._data_shape)): 
+                
+                # Retrieve the coordinate for the current dimension from the 'location' tuple.
+                location_coord = location[dim_original_idx]
+                
+                # Determine the grid index based on the dimension type and fixed stride.
+                # N (Batch) and C (Channel) dimensions usually have a stride of 1, 
+                # meaning their grid index is just their coordinate.
+                if dim_original_idx == 0: # N dimension
+                    grid_idx.append(location_coord)
+                elif dim_original_idx == (len(self._data_shape) - 1): # C dimension (last dimension)
+                    grid_idx.append(location_coord)
+                elif hasattr(self, 'mode_3D') and self.mode_3D and dim_original_idx == 1: # Z dimension if 3D
+                    # Apply stride calculation for Z
+                    grid_idx.append(int(np.floor(location_coord / self._fixed_stride[dim_original_idx])))
+                else: # H or W dimensions (and Z if 2D context handles it as spatial implicitly)
+                    # Use _fixed_stride for reverse calculation for spatial dimensions
+                    grid_idx.append(int(np.floor(location_coord / self._fixed_stride[dim_original_idx])))
+            
+            # Convert the list of calculated grid indices to a tuple and pass to dataset_idx_from_grid_idx.
+            # This method should be inherited from the base GridIndexManager.
+            return self.dataset_idx_from_grid_idx(tuple(grid_idx))
+        else:
+            # If not WindowedTiling, defer to the base class implementation.
+            # This assumes the parent class's get_dataset_idx_from_grid_location handles other modes.
+            return super().get_dataset_idx_from_grid_location(location)
 
     def get_gridstart_location_from_dim_index(self, dim: int, dim_index: int):
         """
@@ -169,8 +203,8 @@ class GridIndexManager:
             else:
                 # on boundary. grid should be placed such that the patch covers the entire data.
                 return self.data_shape[dim] - self.grid_shape[dim] - excess_size
-        else:
-            raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
+        # else:
+        #     raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
 
     def get_location_from_dataset_idx(self, dataset_idx: int):
         """
@@ -343,8 +377,8 @@ class GridIndexManagerRef:
                     0, np.floor((coordinate - excess_size) / self.grid_shape[dim])
                 )
 
-        else:
-            raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
+        # else:
+            # raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
 
     def patch_idx_from_grid_idx(self, shape: tuple, grid_idx: tuple):
         """Returns the index of the patch in the dataset."""
@@ -390,8 +424,8 @@ class GridIndexManagerRef:
             else:
                 # on boundary. grid should be placed such that the patch covers the entire data.
                 return shape[dim_idx] - self.grid_shape[dim_idx] - excess_size
-        else:
-            raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
+        # else:
+        #     raise ValueError(f"Unsupported tiling mode {self.tiling_mode}")
 
     def get_location_from_patch_idx(self, channel_idx: int, patch_idx: int):
         """

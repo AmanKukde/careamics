@@ -8,10 +8,12 @@ import numpy as np
 
 from .utils.empty_patch_fetcher import EmptyPatchFetcher
 from .utils.index_manager import GridIndexManager
+
 from .utils.index_switcher import IndexSwitcher
 from .config import DatasetConfig
 from .types import DataSplitType, TilingMode
 
+from .utils.windowed_tiling_manager import WindowedTilingGridIndexManager
 
 class MultiChDloader:
     def __init__(
@@ -430,9 +432,14 @@ class MultiChDloader:
         patch_shape, grid_shape = self.get_idx_manager_shapes(
             self._img_sz, self._grid_sz
         )
-        self.idx_manager = GridIndexManager(
-            shape, grid_shape, patch_shape, self._tiling_mode
-        )
+        if self._tiling_mode == TilingMode.WindowedTiling:
+            self.idx_manager = WindowedTilingGridIndexManager(
+                shape, grid_shape, patch_shape, self._tiling_mode
+            )
+        else:
+            self.idx_manager = GridIndexManager(
+                shape, grid_shape, patch_shape, self._tiling_mode
+            )
         # self.set_repeat_factor()
 
     def __len__(self):

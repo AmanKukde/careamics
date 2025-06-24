@@ -30,3 +30,4 @@ class TilingMode(Enum):
     TrimBoundary = 0
     PadBoundary = 1
     ShiftBoundary = 2
+    WindowedTiling = 3
