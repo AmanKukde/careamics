@@ -49,7 +49,10 @@ class WindowedTilingLCMultiChDloader(MultiChDloader):
         # Handle both integer (2D) and tuple (3D) grid sizes.
         spatial_grid_size = (grid_size, grid_size) if isinstance(grid_size, int) else grid_size
         # Calculate padding width for each side of each spatial dimension.
-        self.pad_width_spatial = [(int(1.5 * s)-1, int(1.5 * s)-1) for s in spatial_grid_size]
+        # self.pad_width_spatial = [(int(1.5 * s)-1, int(1.5 * s)-1) for s in spatial_grid_size]
+        self.pad_width_spatial = [(int(1.5 * s), int(1.5 * s)) for s in spatial_grid_size]
+
+        # self.pad_width_spatial = [(s,s) for s in spatial_grid_size]
 
         # Construct the full padding tuple for np.pad, with no padding on N and C dims.
         pad_width_full = [(0, 0)]  # N dimension
@@ -71,22 +74,12 @@ class WindowedTilingLCMultiChDloader(MultiChDloader):
             grid_size: Used to confirm padding, but not for tiling.
             stride: The stride of the sliding window.
         """
-        if stride is None or stride == 0:
-            # Assuming grid_size is an int here. If it's a tuple, you'll need to adjust this.
-            if isinstance(grid_size, int):
-                stride_value = math.ceil(grid_size / math.sqrt(50))
-                stride = (1, stride_value, stride_value, 1)
-            elif isinstance(grid_size, tuple):
-                # Example: take first element of tuple to compute stride
-                stride_value = math.ceil(grid_size[0] / math.sqrt(50))
-                stride = (1, stride_value, stride_value, 1)
-            else:
-                raise ValueError("grid_size must be an int or a tuple")
-        # self.stride = 64
+        
+            
         self._img_sz = image_size[-1] if isinstance(image_size, tuple) else image_size
-        self.stride = stride
-        self.stride_value = stride_value
         self._grid_sz = grid_size
+        self.stride, self.stride_value = self.get_stride_length(grid_size, stride)
+        self.stride, self.stride_value = ((1,8,8,1), 8)
 
         print(f"Image size: {self._img_sz}")
         print(f"Grid size: {self._grid_sz}")
@@ -115,6 +108,20 @@ class WindowedTilingLCMultiChDloader(MultiChDloader):
         )
         print(f"Number of patches per dimension: {self.idx_manager.grid_counts_for_flat_idx}")
         print(f"Successfully Initialized Windowed Tiling with {self.idx_manager.total_patch_count()} patches. !!!")
+
+    def get_stride_length(self, grid_size, stride = None):
+        if stride is None or stride == 0:
+            # Assuming grid_size is an int here. If it's a tuple, you'll need to adjust this.
+            if isinstance(grid_size, int):
+                stride_value = math.ceil(grid_size / math.sqrt(50))
+                stride = (1, stride_value, stride_value, 1)
+            elif isinstance(grid_size, tuple):
+                # Example: take first element of tuple to compute stride
+                stride_value = math.ceil(grid_size[0] / math.sqrt(50))
+                stride = (1, stride_value, stride_value, 1)
+            else:
+                raise ValueError("grid_size must be an int or a tuple")
+        return stride, stride_value
 
     def __len__(self):
         """Returns the total number of patches in the dataset."""

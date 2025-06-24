@@ -963,3 +963,63 @@ def stitch_predictions_general(predictions, dset):
                 raise ValueError(f"Unsupported shape {output.shape}")
 
     return output
+
+
+def stitch_predictions_windowed(predictions, dset):
+    """
+    Stitches predicted patches from a sliding window and crops the result
+    back to the original image size. Overlapping regions are averaged.
+
+    Args:
+        predictions: A batch of predicted patches, shape (num_patches, C, [Z], H, W).
+        dset: The WindowedTilingDataset object used, which contains padding info.
+
+    Returns:
+        The final stitched and cropped image, in (N, [Z], H, W, C) format.
+    """
+    
+    padded_shape = dset._padded_data.shape
+    idx_manager = dset.idx_manager
+
+    # Create a canvas for the stitched padded image and a counter for averaging.
+    stitched_padded_image = np.zeros((predictions.shape[1], *padded_shape[1:-1]), dtype=predictions.dtype)
+    counts = np.zeros_like(stitched_padded_image)
+    
+    # Pre-create a patch of ones for efficient counting.
+    patch_ones = np.ones(predictions[0].shape, dtype=predictions.dtype)
+
+    for i in range(len(predictions)):
+        patch = predictions[i]
+        
+        # Get the location of this patch in the padded image canvas.
+        loc = idx_manager.get_patch_location_from_dataset_idx(i)
+        _, *spatial_loc = loc
+
+        # Define slices for placing the patch on the canvas.
+        slices = [slice(None)] # Channel slice
+        for s_loc, s_dim in zip(spatial_loc, idx_manager.patch_spatial_dims):
+            slices.append(slice(int(s_loc), int(s_loc + s_dim)))
+
+        # Add the patch to the canvas and increment the count for averaging.
+        stitched_padded_image[tuple(slices)] += patch
+        counts[tuple(slices)] += patch_ones
+
+    # Average the overlapping regions.
+    counts[counts == 0] = 1  # Avoid division by zero.
+    stitched_padded_image /= counts
+
+    # Crop the stitched image back to the original size using stored padding info.
+    pad_width = dset.pad_width_spatial
+    crop_slices = [slice(None)] # Channel slice
+    for pad_before, pad_after in pad_width:
+        crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
+
+    final_image = stitched_padded_image[tuple(crop_slices)]
+    
+    # Transpose back to original data format (e.g., H, W, C)
+    is_3d = len(dset.original_data_shape) == 5
+    axes_order = (1, 2, 3, 0) if is_3d else (1, 2, 0)
+    final_image_transposed = np.transpose(final_image, axes_order)
+
+    # Add back the N dimension and return.
+    return final_image_transposed[np.newaxis, ...]
