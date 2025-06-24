@@ -4,277 +4,149 @@ from skimage.transform import resize # You'll need this import
 
 # Import the necessary classes
 from .config import DatasetConfig
-from .lc_dataset import LCMultiChDloader
-from .types import TilingMode
+from .multich_dataset import MultiChDloader
+from .types import DataSplitType, TilingMode
+import math
 from careamics.lvae_training.dataset.utils.windowed_tiling_manager import WindowedTilingGridIndexManager
 
-class WindowedTilingLCMultiChDloader(LCMultiChDloader):
+class WindowedTilingLCMultiChDloader(MultiChDloader):
     """
-    A specialized LCMultiChDloader for WindowedTiling mode.
+    A dataset class that inherits from MultiChDloader but implements a
+    different tiling strategy. It pads the entire image first, and then
+    extracts patches using a sliding window with a specified stride.
 
-    This class pre-pads the highest resolution data and adjusts the
-    GridIndexManager to work on the padded data. Lower resolutions are
-    handled by downsampling the *padded* high-resolution data.
+    This approach is designed for inference where all pixels need to be
+    covered, and it avoids the complex boundary handling of the parent class.
     """
-    def __init__(
-        self,
-        data_config: DatasetConfig,
-        fpath: str,
-        load_data_fn: Callable,
-        val_fraction=None,
-        test_fraction=None,
-    ):
-        # Initial call to parent's constructor. This will load _data, _noise_data (original size),
-        # set up _tiling_mode, and crucially, populate _scaled_data and _scaled_noise_data
-        # with downsampled versions of the *original unpadded* data.
-        super().__init__(
-            data_config,
-            fpath,
-            load_data_fn=load_data_fn,
-            val_fraction=val_fraction,
-            test_fraction=test_fraction,
-        )
-        print("Windowed Tiling Initialised")
-
-        if self._tiling_mode == TilingMode.WindowedTiling:
-            # Store original data (unpadded) for reference if needed,
-            # though after padding, all operations should use padded data.
-            self._original_unpadded_data = self._data 
-            self._original_unpadded_noise_data = self._noise_data
-
-            # Calculate padding from the manager (based on original data shape and config)
-            # This padding is for the highest resolution.
-            # _padding will be e.g., ((0,0), (48,48), (48,48), (0,0)) for 2D HWC
-            padding_config_high_res = self.idx_manager._padding 
-
-            # Apply reflect padding to the *highest resolution* data.
-            # self._data now holds the padded high-res image.
-            self._data = np.pad(self._original_unpadded_data, pad_width=padding_config_high_res, mode=self._overlapping_padding_kwargs.get('mode', 'reflect'))
-            if self._original_unpadded_noise_data is not None:
-                self._noise_data = np.pad(self._original_unpadded_noise_data, pad_width=padding_config_high_res, mode=self._overlapping_padding_kwargs.get('mode', 'reflect'))
-            
-            print(f"[WindowedTilingLCMultiChDloader] Padded highest resolution data. Original unpadded shape: {self._original_unpadded_data.shape}, Padded shape: {self._data.shape}")
-
-            # RE-INITIALIZE idx_manager with the *padded* data shape.
-            # This is CRUCIAL. It ensures total_grid_count() and get_patch_location_from_dataset_idx()
-            # are calculated based on the dimensions of the padded image.
-            # The manager's internal stride and padding calculations will now assume `self._data.shape`
-            # as the base image to tile.
+    def __init__(self, *args, **kwargs):
+        """
+        Initializes the dataset. The actual data loading is handled by the
+        parent class. After the data is loaded, it is immediately padded.
+        """
+        self.original_data_shape = None
+        self._padded_data = None
+        self.pad_width_spatial = None
         
-            self.set_img_sz(data_config.image_size, data_config.grid_size)
+        # We need to extract grid_size before calling super, as it's used for padding.
+        # This assumes the config object is the first argument.
+        data_config: DatasetConfig = args[0]
+        self._grid_sz = data_config.grid_size
 
+        super().__init__(*args, **kwargs)
 
-            # CRITICAL CHANGE: RE-GENERATE _scaled_data and _scaled_noise_data
-            # using the *already padded* self._data as the source for downsampling.
-            # This ensures all scales are proportionally padded.
+        # After super().__init__(), self._data is loaded. Now we can pad it.
+        self.original_data_shape = self._data.shape
+        # self._pad_data()
 
-            # Initialize lists with None, then populate
-            self._scaled_data = [None] * (self.multiscale_lowres_count + 1)
-            self._scaled_noise_data = [None] * (self.multiscale_lowres_count + 1)
-
-            # Assign the padded high-res data as the first scale
-            self._scaled_data[0] = self._data
-            if self._noise_data is not None:
-                self._scaled_noise_data[0] = self._noise_data
-
-            # Generate lower resolution versions from the *padded* highest resolution data
-            for scale_idx in range(1, self.multiscale_lowres_count + 1):
-                current_scale_factor = 2**scale_idx
-                
-                # Calculate target shape for the downsampled *padded* image
-                # Assuming data is (N, D, H, W, C) or (N, H, W, C)
-                target_shape = list(self._data.shape) # Start with the padded high-res shape
-
-                if self._5Ddata:
-                    # Downsample Z, H, W dimensions
-                    target_shape[1] = max(1, int(np.ceil(target_shape[1] / current_scale_factor))) # Z
-                    target_shape[2] = max(1, int(np.ceil(target_shape[2] / current_scale_factor))) # H
-                    target_shape[3] = max(1, int(np.ceil(target_shape[3] / current_scale_factor))) # W
-                else: # 2D
-                    # Downsample H, W dimensions
-                    target_shape[1] = max(1, int(np.ceil(target_shape[1] / current_scale_factor))) # H
-                    target_shape[2] = max(1, int(np.ceil(target_shape[2] / current_scale_factor))) # W
-                
-                # Convert to float for resize, then back to original dtype
-                self._scaled_data[scale_idx] = resize(
-                    self._data.astype(np.float32), # Source is the padded high-res data
-                    output_shape=tuple(target_shape),
-                    anti_aliasing=True,
-                    preserve_range=True # Important to keep pixel values in original range
-                ).astype(self._data.dtype)
-
-                if self._noise_data is not None:
-                    self._scaled_noise_data[scale_idx] = resize(
-                        self._noise_data.astype(np.float32), # Source is the padded high-res noise
-                        output_shape=tuple(target_shape),
-                        anti_aliasing=True,
-                        preserve_range=True
-                    ).astype(self._noise_data.dtype)
-
-            print(f"[WindowedTilingLCMultiChDloader] Generated {self.multiscale_lowres_count} lower resolution scales from padded data.")
-            # Optional: Verify shapes for debugging
-            for i, img_s in enumerate(self._scaled_data):
-                print(f"  _scaled_data[{i}].shape: {img_s.shape}")
-
-    def _load_img(self, index: Union[int, Tuple[int, int]]) -> Tuple[np.ndarray, np.ndarray]:
-        """ Overrides the parent's _load_img to handle pre-padded data for WindowedTiling.
-        For WindowedTiling, it directly slices from the pre-padded self._data.
-        This method is primarily for loading the highest resolution (scale 0) patch.
-        For other tiling modes, it defers to the parent's _load_img.
+    def _pad_data(self, grid_size):
         """
-        if self._tiling_mode == TilingMode.WindowedTiling:
-            if isinstance(index, int) or isinstance(index, np.int64):
-                idx = index
+        Pads the loaded image data. The padding amount is 1.5 times the
+        grid_size on each side of the spatial dimensions.
+        """
+        if grid_size is None:
+            raise ValueError("`grid_size` must be set in the config to calculate padding.")
+
+        # Handle both integer (2D) and tuple (3D) grid sizes.
+        spatial_grid_size = (grid_size, grid_size) if isinstance(grid_size, int) else grid_size
+        # Calculate padding width for each side of each spatial dimension.
+        self.pad_width_spatial = [(int(1.5 * s)-1, int(1.5 * s)-1) for s in spatial_grid_size]
+
+        # Construct the full padding tuple for np.pad, with no padding on N and C dims.
+        pad_width_full = [(0, 0)]  # N dimension
+        pad_width_full.extend(self.pad_width_spatial)
+        pad_width_full.append((0, 0))  # C dimension
+
+        print(f"Original data shape: {self._data.shape}")
+        print(f"Padding spatial dimensions with: {self.pad_width_spatial}")
+
+        self._padded_data = np.pad(self._data, pad_width=pad_width_full, mode='constant', constant_values=255)
+        print(f"Padded data shape: {self._padded_data.shape}")
+
+    def set_img_sz(self, image_size, grid_size: Union[int, Tuple[int, int, int]], stride: Union[int, Tuple[int, int, int]] = None):
+        """
+        Overrides the parent method to set up the SlidingWindowIndexManager.
+
+        Args:
+            image_size: The size of the patch to extract (patch_size).
+            grid_size: Used to confirm padding, but not for tiling.
+            stride: The stride of the sliding window.
+        """
+        if stride is None or stride == 0:
+            # Assuming grid_size is an int here. If it's a tuple, you'll need to adjust this.
+            if isinstance(grid_size, int):
+                stride_value = math.ceil(grid_size / math.sqrt(50))
+                stride = (1, stride_value, stride_value, 1)
+            elif isinstance(grid_size, tuple):
+                # Example: take first element of tuple to compute stride
+                stride_value = math.ceil(grid_size[0] / math.sqrt(50))
+                stride = (1, stride_value, stride_value, 1)
             else:
-                idx = index[0]  # Assume index[0] is the batch index if tuple
+                raise ValueError("grid_size must be an int or a tuple")
+        # self.stride = 64
+        self._img_sz = image_size[-1] if isinstance(image_size, tuple) else image_size
+        self.stride = stride
+        self.stride_value = stride_value
+        self._grid_sz = grid_size
 
-            # Get the patch location relative to the *padded* highest-res image
-            patch_start_loc_padded_img = self.idx_manager.get_patch_location_from_dataset_idx(idx)
-            n_idx = patch_start_loc_padded_img[0]  # Batch index
+        print(f"Image size: {self._img_sz}")
+        print(f"Grid size: {self._grid_sz}")
+        print(f"Stride: {self.stride}")
 
-            # spatial_patch_start_loc_tuple will be (Z,H,W) for 5D or (H,W) for 2D, but it's a tuple from manager
-            spatial_patch_start_loc_tuple = patch_start_loc_padded_img[1:]
+        self._pad_data(self._grid_sz)
 
-            # The patch_shape is from the idx_manager (e.g., (1, 64, 64, 1) for 2D, or (1, D, H, W, 1) for 3D)
-            patch_spatial_shape = self.idx_manager.patch_shape[1:-1]  # (Z,H,W) or (H,W)
+        numC = self._padded_data.shape[-1]
+        is_3d = len(self._padded_data.shape) == 5
 
-            # Use direct slicing on the already padded self._data
-            slices = [n_idx]
-            for dim_idx, start_coord in enumerate(spatial_patch_start_loc_tuple):
-                # Ensure dim_idx is within the range of patch_spatial_shape
-                if dim_idx >= len(patch_spatial_shape):
-                    raise IndexError(f"Dimension index {dim_idx} is out of range for patch_spatial_shape {patch_spatial_shape}")
-                slices.append(slice(start_coord, start_coord + patch_spatial_shape[dim_idx]))
-            slices.append(slice(None))  # All channels
-
-            imgs = self._data[tuple(slices)]
-
-            # Safety check: Ensure the extracted patch is exactly the image_size/patch_shape.
-            expected_spatial_shape_for_concat = self.idx_manager.patch_shape[1:-1]  # (Z, H, W) or (H, W)
-            expected_full_shape = expected_spatial_shape_for_concat + (imgs.shape[-1],)  # (Z, H, W, C) or (H, W, C)
-            if imgs.shape != expected_full_shape:
-                print(f"Warning: Extracted high-res patch shape {imgs.shape} does not match expected {expected_full_shape}. Resizing.")
-                imgs = resize(imgs.astype(np.float32), output_shape=expected_full_shape, anti_aliasing=True, preserve_range=True).astype(imgs.dtype)
-
-            # Reformat to tuples of (1, Z, H, W, 1) or (1, H, W, 1) for each channel
-            loaded_imgs = [imgs[None, ..., i] for i in range(imgs.shape[-1])]
-
-            noise = []
-            if self._noise_data is not None and not self._disable_noise:
-                noise_data_patch = self._noise_data[tuple(slices)]  # Apply same slices to noise
-                if noise_data_patch.shape != expected_full_shape:
-                    print(f"Warning: Extracted high-res noise patch shape {noise_data_patch.shape} does not match expected {expected_full_shape}. Resizing.")
-                    noise_data_patch = resize(noise_data_patch.astype(np.float32), output_shape=expected_full_shape, anti_aliasing=True, preserve_range=True).astype(noise_data_patch.dtype)
-                noise = [noise_data_patch[None, ..., i] for i in range(noise_data_patch.shape[-1])]
-
-            return tuple(loaded_imgs), tuple(noise)
+        # Define patch and stride shapes based on data dimensionality.
+        if is_3d:
+            self.patch_shape = (1, self._depth3D, self._img_sz, self._img_sz, numC)
+            self.stride_shape = (1, *(self.stride if isinstance(self.stride, tuple) else (1, self.stride, self.stride)), numC)
         else:
-            # For other tiling modes, use the parent's _load_img logic.
-            return super()._load_img(index)
+            self.patch_shape = (1, self._img_sz, self._img_sz, numC)
+            self.stride_shape = (1, self.stride_value, self.stride_value, numC)
 
+        self.idx_manager = WindowedTilingGridIndexManager(
+            data_shape=self.original_data_shape,
+            grid_shape=self._grid_sz,
+            tiling_mode= TilingMode.WindowedTiling,
+            padded_data_shape=self._padded_data.shape,
+            patch_shape=self.patch_shape,
+            stride=self.stride_shape,
+        )
+        print(f"Number of patches per dimension: {self.idx_manager.grid_counts_for_flat_idx}")
+        print(f"Successfully Initialized Windowed Tiling with {self.idx_manager.total_patch_count()} patches. !!!")
 
-    def _get_img(self, index: int):
+    def __len__(self):
+        """Returns the total number of patches in the dataset."""
+        return self.idx_manager.total_patch_count()
+
+    def __getitem__(self, index: int) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Overrides parent's _get_img. For WindowedTiling, it loads the highest resolution patch
-        from `_load_img`, and then directly extracts patches from the *already downsampled and proportionally padded*
-        lower resolution images in `self._scaled_data`.
+        Gets a single patch for prediction.
+
+        This method overrides the parent's complex __getitem__. It performs a
+        simple slice from the pre-padded image based on the index. It does
+        not perform augmentations, noise addition, or alpha blending.
         """
-        if self._tiling_mode == TilingMode.WindowedTiling:
-            # _load_img already returns the fully cropped highest resolution patch (scale 0)
-            img_tuples_high_res, noise_tuples_high_res = self._load_img(index)
+        # Get the top-left coordinate of the patch from the index manager.
+        patch_loc = self.idx_manager.get_patch_location_from_dataset_idx(index)
+        n_idx, *spatial_loc = patch_loc
 
-            allres_versions = {
-                i: [img_tuples_high_res[i]] for i in range(len(img_tuples_high_res))
-            }
-            allres_noise_versions = { # Initialize noise versions too if needed
-                i: [noise_tuples_high_res[i]] for i in range(len(noise_tuples_high_res))
-            }
+        # Define the slice ranges for the patch extraction.
+        patch_spatial_dims = self.idx_manager.patch_spatial_dims
+        slices = []
+        for loc, dim in zip(spatial_loc, patch_spatial_dims):
+            slices.append(slice(int(loc), int(loc + dim)))
 
+        # Extract the patch from the padded data.
+        if self._5Ddata: # (N, Z, H, W, C)
+            patch = self._padded_data[n_idx, slices[0], slices[1], slices[2], :]
+        else: # (N, H, W, C)
+            patch = self._padded_data[n_idx, slices[0], slices[1], :]
 
-            # Get the patch location for the highest resolution *relative to the padded image*.
-            # This is what idx_manager returns.
-            patch_start_loc_padded_img = self.idx_manager.get_patch_location_from_dataset_idx(index)
-            
-            # Loop through lower resolutions (scale_idx represents the factor for 2^scale_idx)
-            for scale_idx in range(1, self.multiscale_lowres_count + 1): # +1 because 2**0 is high-res, 2**1 is 1st low-res etc.
-                # Get the downsampled version of the *padded* image for this scale
-                full_scaled_padded_img = self._scaled_data[scale_idx] # This is (N, D_scaled, H_scaled, W_scaled, C) or (N, H_scaled, W_scaled, C)
-
-                # Calculate the start location *within this downsampled padded image*
-                current_scale_factor = 2**scale_idx
-                
-                # Apply scaling to each coordinate from the highest-res padded patch start.
-                # N_idx is the first one, then spatial dimensions.
-                n_idx_scaled = patch_start_loc_padded_img[0] # N dimension not scaled
-                
-                # Spatial coordinates are scaled
-                spatial_patch_start_loc_scaled_tuple = tuple(
-                    coord_val // current_scale_factor for coord_val in patch_start_loc_padded_img[1:]
-                )
-                
-                # The patch size for each output resolution is self._img_sz (or patch_shape).
-                # Example: for image_size 64, it's always a 64x64 patch.
-                patch_spatial_shape = self.idx_manager.patch_shape[1:-1] # (Z,H,W) or (H,W)
-
-                # Slice the lower-resolution patch from the *already scaled and proportionally padded* image
-                slices = [n_idx_scaled]
-                for dim_idx, start_coord in enumerate(spatial_patch_start_loc_scaled_tuple):
-                    slices.append(slice(start_coord, start_coord + patch_spatial_shape[dim_idx]))
-                slices.append(slice(None)) # All channels
-
-                current_scale_patch_img = full_scaled_padded_img[tuple(slices)]
-
-                # Safety check: Ensure the extracted patch has the correct final dimensions.
-                # This is crucial. If downsampling or slicing introduced a discrepancy, fix it here.
-                expected_spatial_shape_for_concat = self.idx_manager.patch_shape[1:-1] # (Z, H, W) or (H, W)
-                expected_full_shape = expected_spatial_shape_for_concat + (current_scale_patch_img.shape[-1],) # (Z, H, W, C) or (H, W, C)
-
-                if current_scale_patch_img.shape != expected_full_shape:
-                    print(f"Warning: Extracted low-res patch shape {current_scale_patch_img.shape} does not match expected {expected_full_shape} for scale {scale_idx}. Resizing.")
-                    current_scale_patch_img = resize(current_scale_patch_img.astype(np.float32), 
-                                                        output_shape=expected_full_shape, # Resize to (Z, H, W, C) or (H, W, C)
-                                                        anti_aliasing=True, 
-                                                        preserve_range=True).astype(current_scale_patch_img.dtype)
-
-
-                # Reformat to (1, Z, H, W, 1) or (1, H, W, 1) per channel for concatenation later
-                current_scale_img_tuples = [current_scale_patch_img[None, ..., i] for i in range(current_scale_patch_img.shape[-1])]
-                
-                # Append to allres_versions for each channel
-                for ch_idx in range(len(img_tuples_high_res)):
-                    allres_versions[ch_idx].append(current_scale_img_tuples[ch_idx])
-
-                # Handle noise similarly if it needs to be multiscale
-                if self._noise_data is not None and not self._disable_noise:
-                    full_scaled_padded_noise = self._scaled_noise_data[scale_idx]
-                    current_scale_patch_noise = full_scaled_padded_noise[tuple(slices)]
-
-                    if current_scale_patch_noise.shape != expected_full_shape:
-                         print(f"Warning: Extracted low-res noise patch shape {current_scale_patch_noise.shape} does not match expected {expected_full_shape} for scale {scale_idx}. Resizing.")
-                         current_scale_patch_noise = resize(current_scale_patch_noise.astype(np.float32), 
-                                                            output_shape=expected_full_shape, 
-                                                            anti_aliasing=True, 
-                                                            preserve_range=True).astype(current_scale_patch_noise.dtype)
-
-                    current_scale_noise_tuples = [current_scale_patch_noise[None, ..., i] for i in range(current_scale_patch_noise.shape[-1])]
-                    for ch_idx in range(len(noise_tuples_high_res)):
-                        allres_noise_versions[ch_idx].append(current_scale_noise_tuples[ch_idx])
-
-            # Concatenate all resolution versions for each channel
-            output_img_tuples = tuple(
-                [
-                    np.concatenate(allres_versions[ch_idx])
-                    for ch_idx in range(len(img_tuples_high_res))
-                ]
-            )
-            output_noise_tuples = tuple(
-                [
-                    np.concatenate(allres_noise_versions[ch_idx])
-                    for ch_idx in range(len(noise_tuples_high_res))
-                ]
-            )
-
-            return output_img_tuples, output_noise_tuples
-        else:
-            # For other tiling modes, defer to the parent's _get_img which handles _crop_imgs etc.
-            return super()._get_img(index)
+        # For prediction, input and target are the same.
+        # The output format must be (C, [Z], H, W) for the model.
+        inp = np.transpose(patch, (2, 0, 1)) if not self._5Ddata else np.transpose(patch, (3, 0, 1, 2))
+        
+        # The dataloader in eval_utils expects a tuple of (input, target).
+        return inp.astype(np.float32), inp.copy().astype(np.float32)

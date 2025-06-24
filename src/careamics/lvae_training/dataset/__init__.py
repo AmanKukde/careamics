@@ -6,7 +6,6 @@ from .multicrop_dset import MultiCropDset
 from .multifile_dataset import MultiFileDset
 from .windowed_lc_dataset import WindowedTilingLCMultiChDloader
 from .types import DataSplitType, DataType, TilingMode
-from .dataclass import WindowedTilingDataset
 
 __all__ = [
     "DatasetConfig",
@@ -19,5 +18,5 @@ __all__ = [
     "DataType",
     "DataSplitType",
     "TilingMode",
-    "WindowedTilingDataset"
+    "WindowedTilingLCMultiChDloader"
 ]

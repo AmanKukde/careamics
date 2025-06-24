@@ -432,14 +432,10 @@ class MultiChDloader:
         patch_shape, grid_shape = self.get_idx_manager_shapes(
             self._img_sz, self._grid_sz
         )
-        if self._tiling_mode == TilingMode.WindowedTiling:
-            self.idx_manager = WindowedTilingGridIndexManager(
-                shape, grid_shape, patch_shape, self._tiling_mode
-            )
-        else:
-            self.idx_manager = GridIndexManager(
-                shape, grid_shape, patch_shape, self._tiling_mode
-            )
+        
+        self.idx_manager = GridIndexManager(
+            shape, grid_shape, patch_shape
+        )
         # self.set_repeat_factor()
 
     def __len__(self):
