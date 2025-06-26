@@ -90,10 +90,11 @@ class WindowedTilingLCMultiChDloader(MultiChDloader):
         # A stride of half the grid size is a common choice for overlapping tiles.
 
         if isinstance(grid_size, int): # 2D case
-            stride_val = grid_size // 4
+            stride_val = grid_size // 8
             stride_spatial = (stride_val, stride_val)
         else: # 3D case
-            stride_spatial = tuple(s // 4 for s in grid_size)
+            stride_spatial = tuple(s // 8 for s in grid_size)
+        
         
         print(f"[{self.__class__.__name__}] Image size (patch size): {self._img_sz}")
         print(f"[{self.__class__.__name__}] Grid size: {self._grid_sz}")

@@ -434,7 +434,7 @@ class MultiChDloader:
         )
         
         self.idx_manager = GridIndexManager(
-            shape, grid_shape, patch_shape
+            shape, grid_shape, patch_shape, self._tiling_mode
         )
         # self.set_repeat_factor()
 
