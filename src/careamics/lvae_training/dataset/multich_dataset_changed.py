@@ -64,7 +64,7 @@ class MultiChDloader:
             allow_generation=data_config.allow_generation,
         )
         self._normalized_input = data_config.normalized_input
-        self._quantile = 0.995
+        self._quantile = 1.0
         self._channelwise_quantile = False
         self._background_quantile = 0.0
         self._clip_background_noise_to_zero = False
@@ -392,9 +392,9 @@ class MultiChDloader:
                 ].copy()
         # TODO where tf is self._img_sz defined?
         self.set_img_sz([self._img_sz, self._img_sz], self._grid_sz)
-        print(
-            f"[{self.__class__.__name__}] Data reduced. New data shape: {self._data.shape}"
-        )
+        # print(
+            # f"[{self.__class__.__name__}] Data reduced. New data shape: {self._padded_data.shape}"
+        # )
 
     def get_idx_manager_shapes(
         self, patch_size: int, grid_size: Union[int, Tuple[int, int, int]]
@@ -598,11 +598,18 @@ class MultiChDloader:
                 valid_slice[2][0] : valid_slice[2][1],
             ]
         else:
-            new_img = img[
-                ...,
-                valid_slice[0][0] : valid_slice[0][1],
-                valid_slice[1][0] : valid_slice[1][1],
-            ]
+            try:
+                new_img = img[
+                    ...,
+                    valid_slice[0][0] : valid_slice[0][1],
+                    valid_slice[1][0] : valid_slice[1][1],
+                ]
+            except:
+                new_img = img[
+                    ...,
+                    valid_slice[0][0] : valid_slice[0][1],
+                    valid_slice[1][0] : valid_slice[1][1],
+                ]
 
         # print(np.array(padding).shape, img.shape, new_img.shape)
         # print(padding)
@@ -701,7 +708,7 @@ class MultiChDloader:
         """
         loc_list = self.idx_manager.get_patch_location_from_dataset_idx(index)
         # last dim is channel. we need to take the third and the second last element.
-        return loc_list[1:3]
+        return loc_list[1:]
 
     def compute_individual_mean_std(self):
         # numpy 1.19.2 has issues in computing for large arrays. https://github.com/numpy/numpy/issues/8869
