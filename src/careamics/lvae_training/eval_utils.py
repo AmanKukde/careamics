@@ -652,11 +652,11 @@ def get_single_file_mmse(
                 rec, _ = model(inp)
                 rec = get_img_from_forward_output(rec,model) 
                 # get reconstructed img
-                pdb.set_trace()
+                # pdb.set_trace()
                 rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
 
             # aggregate results
-            pdb.set_trace()
+            # pdb.set_trace()
             samples = torch.cat(rec_img_list, dim=0)
             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
@@ -682,7 +682,6 @@ def get_single_file_mmse(
         stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
         stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
         return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
-
     stitched_predictions = stitch_func(tiles_arr, dset)
     stitched_stds = stitch_func(tile_stds, dset)
     return stitched_predictions, stitched_stds
