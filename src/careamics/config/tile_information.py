@@ -34,6 +34,9 @@ class TileInformation(BaseModel):
 
     stitch_coords: tuple[tuple[int, ...], ...]
     """Coordinates in the original image where to stitch the cropped tile back."""
+    
+    source_crop_coords: tuple[tuple[int, ...], ...]
+    """Coordinates in the original image."""
 
     sample_id: int
     """Sample ID of the tile."""
@@ -62,4 +65,5 @@ class TileInformation(BaseModel):
             and self.overlap_crop_coords == other_tile.overlap_crop_coords
             and self.stitch_coords == other_tile.stitch_coords
             and self.sample_id == other_tile.sample_id
+            and self.source_crop_coords == other_tile.source_crop_coords
         )
