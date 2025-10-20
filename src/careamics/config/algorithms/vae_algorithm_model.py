@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pprint import pformat
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from typing_extensions import Self
@@ -45,12 +45,18 @@ class VAEBasedAlgorithm(BaseModel):
     # NOTE: these are all configs (pydantic models)
     loss: LVAELossConfig
     model: LVAEModel
+<<<<<<< HEAD
     noise_model: Optional[MultiChannelNMConfig] = None
     noise_model_likelihood: Optional[NMLikelihoodConfig] = None
     gaussian_likelihood: Optional[GaussianLikelihoodConfig] = None # TODO change to str
 
     mmse_count: int = 1
     is_supervised: bool = False
+=======
+    noise_model: MultiChannelNMConfig | None = None
+    noise_model_likelihood: NMLikelihoodConfig | None = None
+    gaussian_likelihood: GaussianLikelihoodConfig | None = None
+>>>>>>> v0.0.15
 
     # Optional fields
     optimizer: OptimizerModel = OptimizerModel()
