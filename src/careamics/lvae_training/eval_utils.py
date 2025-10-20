@@ -8,7 +8,7 @@ It includes functions to:
 
 import os
 from typing import Optional
-
+import dill
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,6 +21,8 @@ from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
 from careamics.utils.metrics import scale_invariant_psnr
 
+import pdb
+from usplit.analysis.lvae_utils import get_img_from_forward_output
 
 class TilingMode:
     """
@@ -483,6 +485,7 @@ def get_predictions(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
+    sliding_window_flag = False,
 ) -> tuple[dict, dict, dict]:
     """Get patch-wise predictions from a model for the entire dataset.
 
@@ -516,7 +519,7 @@ def get_predictions(
         multifile_stitched_predictions = {}
         multifile_stitched_stds = {}
         for d in dset.dsets:
-            stitched_predictions, stitched_stds = get_single_file_mmse(
+            stitched_predictions, stitched_stds, *counts = get_single_file_mmse(
                 model=model,
                 dset=d,
                 batch_size=batch_size,
@@ -524,6 +527,7 @@ def get_predictions(
                 grid_size=grid_size,
                 mmse_count=mmse_count,
                 num_workers=num_workers,
+                sliding_window_flag = sliding_window_flag,
             )
             # get filename without extension and path
             filename = d._fpath.name
@@ -534,7 +538,7 @@ def get_predictions(
             multifile_stitched_stds,
         )
     else:
-        stitched_predictions, stitched_stds = get_single_file_mmse(
+        stitched_predictions, stitched_stds, *counts = get_single_file_mmse(
             model=model,
             dset=dset,
             batch_size=batch_size,
@@ -542,16 +546,23 @@ def get_predictions(
             grid_size=grid_size,
             mmse_count=mmse_count,
             num_workers=num_workers,
+            sliding_window_flag = sliding_window_flag,
         )
         # TODO stitching still not working properly for weirdly shaped images
         # get filename without extension and path
         # TODO in the ref ds this is the name of a folder not file :(
         filename = dset._fpath.name
+        if len(counts)>0:
+            return (
+                {filename: stitched_predictions},
+                {filename: stitched_stds},
+                {filename: counts[0]},
+                {filename: counts[1]},
+            )
         return (
             {filename: stitched_predictions},
-            {filename: stitched_stds},
+            {filename: stitched_stds}
         )
-
 
 def get_single_file_predictions(
     model: VAEModule,
@@ -609,6 +620,7 @@ def get_single_file_mmse(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
+    sliding_window_flag = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get patch-wise predictions from a model for a single file dataset."""
     device = get_device()
@@ -620,14 +632,14 @@ def get_single_file_mmse(
         shuffle=False,
         batch_size=batch_size,
     )
-    if tile_size and grid_size:
-        dset.set_img_sz(tile_size, grid_size)
+    # if tile_size and grid_size:
+    #     dset.set_img_sz(tile_size, grid_size)
 
     model.eval()
     model.to(device)
     tile_mmse = []
     tile_stds = []
-    logvar_arr = []
+    # logvar_arr = []
     with torch.no_grad():
         for batch in tqdm(dloader, desc="Predicting tiles"):
             inp, tar = batch
@@ -636,20 +648,15 @@ def get_single_file_mmse(
 
             rec_img_list = []
             for _ in range(mmse_count):
-
                 # get model output
                 rec, _ = model(inp)
-
+                rec = get_img_from_forward_output(rec,model) 
                 # get reconstructed img
-                if model.model.predict_logvar is None:
-                    rec_img = rec
-                    logvar = torch.tensor([-1])
-                else:
-                    rec_img, logvar = torch.chunk(rec, chunks=2, dim=1)
-                rec_img_list.append(rec_img.cpu().unsqueeze(0))  # add MMSE dim
-                logvar_arr.append(logvar.cpu().numpy())  # Why do we need this ?
+                # pdb.set_trace()
+                rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
 
             # aggregate results
+            # pdb.set_trace()
             samples = torch.cat(rec_img_list, dim=0)
             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
@@ -660,11 +667,21 @@ def get_single_file_mmse(
     tiles_arr = np.concatenate(tile_mmse, axis=0)
     tile_stds = np.concatenate(tile_stds, axis=0)
     # TODO temporary hack, because of the stupid jupyter!
+    
     # If a user reruns a cell with class definition, isinstance will return False
     if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
         stitch_func = stitch_predictions_general
     else:
         stitch_func = stitch_predictions_new
+    if sliding_window_flag:
+        stitch_func = stitch_and_crop_predictions_inner_tile
+    
+    print(f"Using {stitch_func}")
+
+    if sliding_window_flag:
+        stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
+        stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
+        return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
     stitched_predictions = stitch_func(tiles_arr, dset)
     stitched_stds = stitch_func(tile_stds, dset)
     return stitched_predictions, stitched_stds
@@ -963,3 +980,367 @@ def stitch_predictions_general(predictions, dset):
                 raise ValueError(f"Unsupported shape {output.shape}")
 
     return output
+
+
+# def stitch_and_crop_predictions_inner_tile(predictions, dset):
+#     """
+#     Stitch only the inner centered tile from each prediction patch into the big canvas,
+#     then average overlapping regions and crop back to the original size.
+
+#     Args:
+#         predictions: np.array of shape (num_patches, C, [Z], H, W)
+#         dset: Dataset object with padding info, original shape, etc.
+
+#     Returns:
+#         Stitched and cropped image of shape (N, [Z], H, W, C)
+#     """
+
+#     padded_shape = dset._data.shape  # (N, H_pad, W_pad, C)
+#     idx_manager = dset.idx_manager
+
+#     # Create canvas and count matrix for averaging.
+#     stitched_padded_image = np.zeros((predictions.shape[1], *padded_shape[1:-1]), dtype=predictions.dtype)
+#     counts = np.zeros_like(stitched_padded_image)
+
+#     # Parameters for inner tile cropping
+#     full_tile_size = idx_manager.patch_spatial_dims[0]  # assuming square tile: 64
+#     inner_tile_size = full_tile_size // 2  # 32 (the inner centered tile)
+#     start_inner = (full_tile_size - inner_tile_size) // 2  # 16, inner tile starts at 16
+#     end_inner = start_inner + inner_tile_size  # 48
+
+#     # Pre-create a patch of ones for counting the inner tile area
+#     patch_ones = np.ones((predictions.shape[1], inner_tile_size, inner_tile_size), dtype=predictions.dtype)
+
+#     for i in tqdm(range(len(predictions)), desc="Stitching the inner crops"):
+#         patch = predictions[i]  # shape: (C, H=64, W=64)
+
+#         # Crop out the central inner tile from the patch
+#         inner_patch = patch[:, start_inner:end_inner, start_inner:end_inner]  # shape (C, 32, 32)
+
+#         # Get location of this patch on the padded canvas
+#         loc = idx_manager.get_patch_location_from_dataset_idx(i)
+#         _, *spatial_loc = loc  # spatial_loc corresponds to top-left corner of the full patch on padded canvas
+
+#         # Adjust the location to place the inner tile inside the full patch location
+#         # Because the inner tile is centered inside the patch, we add offset start_inner to spatial loc
+#         inner_spatial_loc = [s + start_inner for s in spatial_loc]
+
+#         # Create slices for placing the inner tile
+#         slices = [slice(None)]  # channel slice
+#         for s_loc, s_dim in zip(inner_spatial_loc, [inner_tile_size]*len(inner_spatial_loc)):
+#             slices.append(slice(int(s_loc), int(s_loc + s_dim)))
+
+#         # Add inner patch to canvas and count
+#         stitched_padded_image[tuple(slices)] += inner_patch
+#         counts[tuple(slices)] += patch_ones
+
+#     # Avoid division by zero for averaging
+#     counts[counts == 0] = 1
+#     stitched_padded_image /= counts
+
+#     # Crop back to original size (remove padding)
+#     # pad_width = dset.pad_width_spatial  # [(48,48), (48,48)]
+#     pad_width = [(0,0), (0,0)]
+#     crop_slices = [slice(None)]  # channel slice
+#     for pad_before, pad_after in pad_width:
+#         crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
+
+#     final_image = stitched_padded_image[tuple(crop_slices)]
+
+#     # Transpose back to original data format (e.g., H, W, C)
+#     is_3d = len(dset._data.shape) == 5
+#     axes_order = (1, 2, 3, 0) if is_3d else (1, 2, 0)
+#     final_image_transposed = np.transpose(final_image, axes_order)
+
+#     # Add back the batch dimension (N)
+#     return final_image_transposed[np.newaxis, ...], counts#, stitched_padded_image
+
+
+# import numpy as np
+# from pathlib import Path
+# from tqdm import tqdm
+# import os
+import pickle
+import time
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# import os
+import re
+# import pickle
+# from pathlib import Path
+from array import array
+# import time
+
+def get_pred_files(pred_dir, prefix="pred_", suffix=".npy", cache=True):
+    """
+    Efficiently discover sequentially numbered prediction files, sorted by numeric index.
+
+    Works even if:
+      - Indices start at a high number
+      - There are gaps in numbering
+      - Cache exists but is corrupted
+      - Millions of files are present
+
+    Args:
+        pred_dir (str or Path): Directory containing prediction files.
+        prefix (str): Filename prefix (default 'pred_').
+        suffix (str): Filename suffix (default '.npy').
+        cache (bool): Whether to use/save a cache file for speed.
+
+    Returns:
+        List[Path]: Sorted list of prediction file paths.
+    """
+    pred_dir = Path(pred_dir)
+    cache_path = pred_dir / "pred_file_cache.pkl"
+
+    # Try cache first
+    if cache and cache_path.exists():
+        try:
+            files = pickle.load(open(cache_path, "rb"))
+            if files:
+                print(f"✅ Loaded {len(files)} files from cache.")
+                return files
+        except Exception:
+            print("⚠️ Cache corrupted or unreadable. Rebuilding...")
+
+    t0 = time.time()
+    pattern = re.compile(rf"{prefix}(\d+){suffix}$")
+    matches = array('I')  # store indices efficiently
+    paths = []
+
+    # Efficient directory scan
+    with os.scandir(pred_dir) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            m = pattern.match(entry.name)
+            if m:
+                idx = int(m.group(1))
+                matches.append(idx)
+                paths.append((idx, Path(entry.path)))
+
+    if not matches:
+        raise RuntimeError(f"No prediction files found in {pred_dir}")
+
+    # Sort by numeric index
+    sorted_pairs = sorted(zip(matches, paths), key=lambda x: x[0])
+    files = [p for _, p in sorted_pairs]
+
+    # Save cache
+    if cache:
+        try:
+            pickle.dump(files, open(cache_path, "wb"))
+        except Exception:
+            print("⚠️ Failed to write cache. Ignoring.")
+
+    print(f"✅ Found {len(files)} prediction files in {time.time() - t0:.2f}s")
+    return files
+
+
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import numpy as np
+
+
+def stitch_and_crop_predictions_inner_tile_from_dir(
+    pred_dir,
+    dset,
+    num_patches,
+    num_workers=8,
+    inner_fraction=0.5,
+    batch_size=64,
+    digits=10,
+    use_memmap=False,
+    skip_missing=True,
+):
+    """
+    Fast & reliable version for stitching prediction tiles into full images.
+
+    Skips directory scanning (just constructs expected file names directly),
+    supports parallel I/O, and handles missing or corrupt files gracefully.
+
+    Args:
+        pred_dir: Path to directory containing prediction files.
+        dset: Dataset object with ._data.shape, .idx_manager, .pad_width_spatial.
+        num_patches: Total number of patches to stitch (int).
+        num_workers: Threads for parallel file loading.
+        inner_fraction: Fraction of patch to take as centered inner crop (e.g. 0.5 -> inner half).
+        batch_size: Number of patches loaded per parallel batch.
+        digits: Zero-padding digits in filenames (e.g., 10 for pred_0000000000.npy).
+        use_memmap: Use disk-based accumulation arrays instead of RAM.
+        skip_missing: If True, skip missing/corrupt .npy files instead of crashing.
+
+    Returns:
+        final_image: Cropped stitched image (N, H, W, C)
+        counts: Pixel count matrix (same shape as padded image)
+    """
+    pred_dir = Path(pred_dir)
+
+    # -------------------------------------------------------------------------
+    # Generate file list directly (no directory scan)
+    # -------------------------------------------------------------------------
+    pred_files = [pred_dir / f"pred_{i:0{digits}d}.npy" for i in range(num_patches)]
+
+    padded_shape = dset._data.shape  # (N, H_pad, W_pad, C)
+    idx_manager = dset.idx_manager
+
+    # -------------------------------------------------------------------------
+    # Allocate accumulation arrays (RAM or disk)
+    # -------------------------------------------------------------------------
+    if use_memmap:
+        stitched = np.memmap(pred_dir / "stitched_tmp.dat", dtype=np.float32, mode="w+", shape=padded_shape)
+        counts = np.memmap(pred_dir / "counts_tmp.dat", dtype=np.float32, mode="w+", shape=padded_shape)
+    else:
+        stitched = np.zeros(padded_shape, dtype=np.float32)
+        counts = np.zeros_like(stitched, dtype=np.float32)
+
+    # -------------------------------------------------------------------------
+    # Tile geometry setup
+    # -------------------------------------------------------------------------
+    full_tile_size = idx_manager.patch_spatial_dims[0]
+    inner_tile_size = int(full_tile_size * inner_fraction)
+    start_inner = (full_tile_size - inner_tile_size) // 2
+
+    # -------------------------------------------------------------------------
+    # Worker function: load + crop + return data for stitching
+    # -------------------------------------------------------------------------
+    def load_and_process(i, path):
+        """Load one patch, crop inner, compute spatial position."""
+        if not path.exists():
+            if skip_missing:
+                return None
+            else:
+                raise FileNotFoundError(f"Missing prediction file: {path}")
+
+        try:
+            patch = np.load(path, allow_pickle=False)  # (C, H, W)
+        except Exception as e:
+            if skip_missing:
+                return None
+            else:
+                raise RuntimeError(f"Error loading {path}: {e}")
+
+        patch = np.transpose(patch, (1, 2, 0))  # -> (H, W, C)
+        inner_patch = patch[
+            start_inner:start_inner + inner_tile_size,
+            start_inner:start_inner + inner_tile_size,
+            :
+        ]
+        loc = idx_manager.get_patch_location_from_dataset_idx(i)
+        batch_idx, *spatial_loc = loc
+        inner_spatial_loc = [s + start_inner for s in spatial_loc]
+        return batch_idx, inner_spatial_loc, inner_patch
+
+    # -------------------------------------------------------------------------
+    # Parallel batch stitching
+    # -------------------------------------------------------------------------
+    for batch_start in tqdm(range(0, num_patches, batch_size), desc="Stitching predictions"):
+        batch_files = pred_files[batch_start: batch_start + batch_size]
+
+        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            futures = {ex.submit(load_and_process, i + batch_start, f): f for i, f in enumerate(batch_files)}
+
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is None:
+                    continue  # skip missing or bad file
+
+                batch_idx, inner_spatial_loc, inner_patch = result
+                slices = [batch_idx]
+                for s in inner_spatial_loc:
+                    slices.append(slice(int(s), int(s + inner_tile_size)))
+                slices.append(slice(None))
+                stitched[tuple(slices)] += inner_patch
+                counts[tuple(slices)] += 1
+
+    # -------------------------------------------------------------------------
+    # Normalize & crop padded region
+    # -------------------------------------------------------------------------
+    counts[counts == 0] = 1
+    stitched /= counts
+
+    pad_width = getattr(dset, "pad_width_spatial", [(0, 0), (0, 0)])
+    crop_slices = [slice(None)]
+    for pad_before, pad_after in pad_width:
+        crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
+    crop_slices.append(slice(None))
+
+    final_image = stitched[tuple(crop_slices)]
+    return final_image, counts
+
+
+def stitch_and_crop_predictions_inner_tile(predictions, dset):
+    """
+    Stitch only the inner centered tile from each prediction patch into the big canvas,
+    then average overlapping regions and crop back to the original size.
+
+    Args:
+        predictions: np.array of shape (num_patches, C, H, W)
+        dset: Dataset object with padding info, original shape, etc.
+
+    Returns:
+        Stitched and cropped image of shape (N, H, W, C)
+    """
+
+    padded_shape = dset._data.shape  # (N, H_pad, W_pad, C)
+    idx_manager = dset.idx_manager
+
+    # Create canvas and count matrix for averaging.
+    stitched_padded_image = np.zeros(padded_shape, dtype=predictions.dtype)
+    counts = np.zeros_like(stitched_padded_image, dtype=np.float32)
+
+    # Parameters for inner tile cropping
+    full_tile_size = idx_manager.patch_spatial_dims[0]  # e.g. 64
+    inner_tile_size = full_tile_size // 2  # e.g. 32 (the inner centered tile)
+    start_inner = (full_tile_size - inner_tile_size) // 2  # e.g. 16
+    end_inner = start_inner + inner_tile_size  # e.g. 48
+
+    for i in tqdm(range(len(predictions)), desc="Stitching the inner crops"):
+        patch = predictions[i]  # shape: (C, H, W)
+
+        # Convert patch from (C, H, W) to (H, W, C) for easier placement
+        patch = np.transpose(patch, (1, 2, 0))
+
+        # Crop out the central inner tile from the patch spatially
+        inner_patch = patch[start_inner:end_inner, start_inner:end_inner, :]  # (inner_tile, inner_tile, C)
+
+        # Get location of this patch on the padded canvas
+        loc = idx_manager.get_patch_location_from_dataset_idx(i)
+        batch_idx, *spatial_loc = loc  # batch index and spatial location (top-left corner of patch)
+
+        # Adjust spatial location to inner tile offset
+        inner_spatial_loc = [s + start_inner for s in spatial_loc]
+
+        # Create slices for stitched image and counts
+        slices_img = [batch_idx]
+        slices_count = [batch_idx]
+        for s_loc in inner_spatial_loc:
+            slices_img.append(slice(int(s_loc), int(s_loc + inner_tile_size)))
+            slices_count.append(slice(int(s_loc), int(s_loc + inner_tile_size)))
+        slices_img.append(slice(None))  # channel last
+        slices_count.append(slice(None))
+
+        # Add inner patch to canvas and update counts
+        stitched_padded_image[tuple(slices_img)] += inner_patch
+        counts[tuple(slices_count)] += 1
+
+    # Avoid division by zero in averaging
+    counts[counts == 0] = 1
+    stitched_padded_image /= counts
+
+    # Crop back to original size (remove padding)
+    if hasattr(dset, "pad_width_spatial"):
+        pad_width = dset.pad_width_spatial  # e.g. [(48,48), (48,48)] for H and W dims
+    else:
+        pad_width = [(0, 0), (0, 0)]
+
+    crop_slices = [slice(None)]
+    for pad_before, pad_after in pad_width:
+        crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
+    crop_slices.append(slice(None))
+
+    final_image = stitched_padded_image[tuple(crop_slices)]
+
+    return final_image,  counts

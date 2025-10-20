@@ -106,6 +106,7 @@ class DatasetConfig(BaseModel):
     """Number of LC scales"""
 
     tiling_mode: Optional[TilingMode] = TilingMode.ShiftBoundary
+    # tiling_mode: Optional[TilingMode] = TilingMode.TrimBoundary
 
     target_separate_normalization: Optional[bool] = True
 
@@ -121,3 +122,5 @@ class DatasetConfig(BaseModel):
     random_flip_z_3D: Optional[bool] = False
 
     padding_kwargs: Optional[dict] = None
+
+    sliding_window_flag: Optional[bool] = False
