@@ -1056,6 +1056,219 @@ def stitch_predictions_general(predictions, dset):
 #     return final_image_transposed[np.newaxis, ...], counts#, stitched_padded_image
 
 
+# import numpy as np
+# from pathlib import Path
+# from tqdm import tqdm
+# import os
+import pickle
+import time
+# from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# import os
+import re
+# import pickle
+# from pathlib import Path
+from array import array
+# import time
+
+def get_pred_files(pred_dir, prefix="pred_", suffix=".npy", cache=True):
+    """
+    Efficiently discover sequentially numbered prediction files, sorted by numeric index.
+
+    Works even if:
+      - Indices start at a high number
+      - There are gaps in numbering
+      - Cache exists but is corrupted
+      - Millions of files are present
+
+    Args:
+        pred_dir (str or Path): Directory containing prediction files.
+        prefix (str): Filename prefix (default 'pred_').
+        suffix (str): Filename suffix (default '.npy').
+        cache (bool): Whether to use/save a cache file for speed.
+
+    Returns:
+        List[Path]: Sorted list of prediction file paths.
+    """
+    pred_dir = Path(pred_dir)
+    cache_path = pred_dir / "pred_file_cache.pkl"
+
+    # Try cache first
+    if cache and cache_path.exists():
+        try:
+            files = pickle.load(open(cache_path, "rb"))
+            if files:
+                print(f"✅ Loaded {len(files)} files from cache.")
+                return files
+        except Exception:
+            print("⚠️ Cache corrupted or unreadable. Rebuilding...")
+
+    t0 = time.time()
+    pattern = re.compile(rf"{prefix}(\d+){suffix}$")
+    matches = array('I')  # store indices efficiently
+    paths = []
+
+    # Efficient directory scan
+    with os.scandir(pred_dir) as it:
+        for entry in it:
+            if not entry.is_file():
+                continue
+            m = pattern.match(entry.name)
+            if m:
+                idx = int(m.group(1))
+                matches.append(idx)
+                paths.append((idx, Path(entry.path)))
+
+    if not matches:
+        raise RuntimeError(f"No prediction files found in {pred_dir}")
+
+    # Sort by numeric index
+    sorted_pairs = sorted(zip(matches, paths), key=lambda x: x[0])
+    files = [p for _, p in sorted_pairs]
+
+    # Save cache
+    if cache:
+        try:
+            pickle.dump(files, open(cache_path, "wb"))
+        except Exception:
+            print("⚠️ Failed to write cache. Ignoring.")
+
+    print(f"✅ Found {len(files)} prediction files in {time.time() - t0:.2f}s")
+    return files
+
+
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+import numpy as np
+
+
+def stitch_and_crop_predictions_inner_tile_from_dir(
+    pred_dir,
+    dset,
+    num_patches,
+    num_workers=8,
+    inner_fraction=0.5,
+    batch_size=64,
+    digits=10,
+    use_memmap=False,
+    skip_missing=True,
+):
+    """
+    Fast & reliable version for stitching prediction tiles into full images.
+
+    Skips directory scanning (just constructs expected file names directly),
+    supports parallel I/O, and handles missing or corrupt files gracefully.
+
+    Args:
+        pred_dir: Path to directory containing prediction files.
+        dset: Dataset object with ._data.shape, .idx_manager, .pad_width_spatial.
+        num_patches: Total number of patches to stitch (int).
+        num_workers: Threads for parallel file loading.
+        inner_fraction: Fraction of patch to take as centered inner crop (e.g. 0.5 -> inner half).
+        batch_size: Number of patches loaded per parallel batch.
+        digits: Zero-padding digits in filenames (e.g., 10 for pred_0000000000.npy).
+        use_memmap: Use disk-based accumulation arrays instead of RAM.
+        skip_missing: If True, skip missing/corrupt .npy files instead of crashing.
+
+    Returns:
+        final_image: Cropped stitched image (N, H, W, C)
+        counts: Pixel count matrix (same shape as padded image)
+    """
+    pred_dir = Path(pred_dir)
+
+    # -------------------------------------------------------------------------
+    # Generate file list directly (no directory scan)
+    # -------------------------------------------------------------------------
+    pred_files = [pred_dir / f"pred_{i:0{digits}d}.npy" for i in range(num_patches)]
+
+    padded_shape = dset._data.shape  # (N, H_pad, W_pad, C)
+    idx_manager = dset.idx_manager
+
+    # -------------------------------------------------------------------------
+    # Allocate accumulation arrays (RAM or disk)
+    # -------------------------------------------------------------------------
+    if use_memmap:
+        stitched = np.memmap(pred_dir / "stitched_tmp.dat", dtype=np.float32, mode="w+", shape=padded_shape)
+        counts = np.memmap(pred_dir / "counts_tmp.dat", dtype=np.float32, mode="w+", shape=padded_shape)
+    else:
+        stitched = np.zeros(padded_shape, dtype=np.float32)
+        counts = np.zeros_like(stitched, dtype=np.float32)
+
+    # -------------------------------------------------------------------------
+    # Tile geometry setup
+    # -------------------------------------------------------------------------
+    full_tile_size = idx_manager.patch_spatial_dims[0]
+    inner_tile_size = int(full_tile_size * inner_fraction)
+    start_inner = (full_tile_size - inner_tile_size) // 2
+
+    # -------------------------------------------------------------------------
+    # Worker function: load + crop + return data for stitching
+    # -------------------------------------------------------------------------
+    def load_and_process(i, path):
+        """Load one patch, crop inner, compute spatial position."""
+        if not path.exists():
+            if skip_missing:
+                return None
+            else:
+                raise FileNotFoundError(f"Missing prediction file: {path}")
+
+        try:
+            patch = np.load(path, allow_pickle=False)  # (C, H, W)
+        except Exception as e:
+            if skip_missing:
+                return None
+            else:
+                raise RuntimeError(f"Error loading {path}: {e}")
+
+        patch = np.transpose(patch, (1, 2, 0))  # -> (H, W, C)
+        inner_patch = patch[
+            start_inner:start_inner + inner_tile_size,
+            start_inner:start_inner + inner_tile_size,
+            :
+        ]
+        loc = idx_manager.get_patch_location_from_dataset_idx(i)
+        batch_idx, *spatial_loc = loc
+        inner_spatial_loc = [s + start_inner for s in spatial_loc]
+        return batch_idx, inner_spatial_loc, inner_patch
+
+    # -------------------------------------------------------------------------
+    # Parallel batch stitching
+    # -------------------------------------------------------------------------
+    for batch_start in tqdm(range(0, num_patches, batch_size), desc="Stitching predictions"):
+        batch_files = pred_files[batch_start: batch_start + batch_size]
+
+        with ThreadPoolExecutor(max_workers=num_workers) as ex:
+            futures = {ex.submit(load_and_process, i + batch_start, f): f for i, f in enumerate(batch_files)}
+
+            for fut in as_completed(futures):
+                result = fut.result()
+                if result is None:
+                    continue  # skip missing or bad file
+
+                batch_idx, inner_spatial_loc, inner_patch = result
+                slices = [batch_idx]
+                for s in inner_spatial_loc:
+                    slices.append(slice(int(s), int(s + inner_tile_size)))
+                slices.append(slice(None))
+                stitched[tuple(slices)] += inner_patch
+                counts[tuple(slices)] += 1
+
+    # -------------------------------------------------------------------------
+    # Normalize & crop padded region
+    # -------------------------------------------------------------------------
+    counts[counts == 0] = 1
+    stitched /= counts
+
+    pad_width = getattr(dset, "pad_width_spatial", [(0, 0), (0, 0)])
+    crop_slices = [slice(None)]
+    for pad_before, pad_after in pad_width:
+        crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
+    crop_slices.append(slice(None))
+
+    final_image = stitched[tuple(crop_slices)]
+    return final_image, counts
 
 
 def stitch_and_crop_predictions_inner_tile(predictions, dset):

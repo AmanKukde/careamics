@@ -106,6 +106,7 @@ class DatasetConfig(BaseModel):
     """Number of LC scales"""
 
     tiling_mode: Optional[TilingMode] = TilingMode.ShiftBoundary
+    # tiling_mode: Optional[TilingMode] = TilingMode.TrimBoundary
 
     target_separate_normalization: Optional[bool] = True
 
