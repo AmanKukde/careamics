@@ -122,5 +122,3 @@ class DatasetConfig(BaseModel):
     random_flip_z_3D: Optional[bool] = False
 
     padding_kwargs: Optional[dict] = None
-
-    sliding_window_flag: Optional[bool] = False
