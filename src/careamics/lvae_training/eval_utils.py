@@ -639,7 +639,7 @@ def get_single_file_mmse(
     model.to(device)
     tile_mmse = []
     tile_stds = []
-    # logvar_arr = []
+    logvar_arr = []
     with torch.no_grad():
         for batch in tqdm(dloader, desc="Predicting tiles"):
             inp, tar = batch
@@ -648,15 +648,20 @@ def get_single_file_mmse(
 
             rec_img_list = []
             for _ in range(mmse_count):
+
                 # get model output
                 rec, _ = model(inp)
-                rec = get_img_from_forward_output(rec,model) 
+
                 # get reconstructed img
-                # pdb.set_trace()
-                rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
+                if model.model.predict_logvar is None:
+                    rec_img = rec
+                    logvar = torch.tensor([-1])
+                else:
+                    rec_img, logvar = torch.chunk(rec, chunks=2, dim=1)
+                rec_img_list.append(rec_img.cpu().unsqueeze(0))  # add MMSE dim
+                logvar_arr.append(logvar.cpu().numpy())  # Why do we need this ?
 
             # aggregate results
-            # pdb.set_trace()
             samples = torch.cat(rec_img_list, dim=0)
             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
@@ -673,6 +678,7 @@ def get_single_file_mmse(
         stitch_func = stitch_predictions_general
     else:
         stitch_func = stitch_predictions_new
+        
     if sliding_window_flag:
         stitch_func = stitch_and_crop_predictions_inner_tile
     
