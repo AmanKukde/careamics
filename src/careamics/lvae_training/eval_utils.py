@@ -6,7 +6,10 @@ It includes functions to:
     - create plots to visualize the results.
 """
 
+from array import array
 import os
+import re
+from time import time
 from typing import Optional
 import dill
 import matplotlib
@@ -21,7 +24,7 @@ from tqdm import tqdm
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-
+import pickle
 from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
 from careamics.utils.metrics import scale_invariant_psnr
@@ -990,97 +993,6 @@ def stitch_predictions_general(predictions, dset):
                 raise ValueError(f"Unsupported shape {output.shape}")
 
     return output
-
-
-# def stitch_and_crop_predictions_inner_tile(predictions, dset):
-#     """
-#     Stitch only the inner centered tile from each prediction patch into the big canvas,
-#     then average overlapping regions and crop back to the original size.
-
-#     Args:
-#         predictions: np.array of shape (num_patches, C, [Z], H, W)
-#         dset: Dataset object with padding info, original shape, etc.
-
-#     Returns:
-#         Stitched and cropped image of shape (N, [Z], H, W, C)
-#     """
-
-#     padded_shape = dset._data.shape  # (N, H_pad, W_pad, C)
-#     idx_manager = dset.idx_manager
-
-#     # Create canvas and count matrix for averaging.
-#     stitched_padded_image = np.zeros((predictions.shape[1], *padded_shape[1:-1]), dtype=predictions.dtype)
-#     counts = np.zeros_like(stitched_padded_image)
-
-#     # Parameters for inner tile cropping
-#     full_tile_size = idx_manager.patch_spatial_dims[0]  # assuming square tile: 64
-#     inner_tile_size = full_tile_size // 2  # 32 (the inner centered tile)
-#     start_inner = (full_tile_size - inner_tile_size) // 2  # 16, inner tile starts at 16
-#     end_inner = start_inner + inner_tile_size  # 48
-
-#     # Pre-create a patch of ones for counting the inner tile area
-#     patch_ones = np.ones((predictions.shape[1], inner_tile_size, inner_tile_size), dtype=predictions.dtype)
-
-#     for i in tqdm(range(len(predictions)), desc="Stitching the inner crops"):
-#         patch = predictions[i]  # shape: (C, H=64, W=64)
-
-#         # Crop out the central inner tile from the patch
-#         inner_patch = patch[:, start_inner:end_inner, start_inner:end_inner]  # shape (C, 32, 32)
-
-#         # Get location of this patch on the padded canvas
-#         loc = idx_manager.get_patch_location_from_dataset_idx(i)
-#         _, *spatial_loc = loc  # spatial_loc corresponds to top-left corner of the full patch on padded canvas
-
-#         # Adjust the location to place the inner tile inside the full patch location
-#         # Because the inner tile is centered inside the patch, we add offset start_inner to spatial loc
-#         inner_spatial_loc = [s + start_inner for s in spatial_loc]
-
-#         # Create slices for placing the inner tile
-#         slices = [slice(None)]  # channel slice
-#         for s_loc, s_dim in zip(inner_spatial_loc, [inner_tile_size]*len(inner_spatial_loc)):
-#             slices.append(slice(int(s_loc), int(s_loc + s_dim)))
-
-#         # Add inner patch to canvas and count
-#         stitched_padded_image[tuple(slices)] += inner_patch
-#         counts[tuple(slices)] += patch_ones
-
-#     # Avoid division by zero for averaging
-#     counts[counts == 0] = 1
-#     stitched_padded_image /= counts
-
-#     # Crop back to original size (remove padding)
-#     # pad_width = dset.pad_width_spatial  # [(48,48), (48,48)]
-#     pad_width = [(0,0), (0,0)]
-#     crop_slices = [slice(None)]  # channel slice
-#     for pad_before, pad_after in pad_width:
-#         crop_slices.append(slice(pad_before, -pad_after if pad_after > 0 else None))
-
-#     final_image = stitched_padded_image[tuple(crop_slices)]
-
-#     # Transpose back to original data format (e.g., H, W, C)
-#     is_3d = len(dset._data.shape) == 5
-#     axes_order = (1, 2, 3, 0) if is_3d else (1, 2, 0)
-#     final_image_transposed = np.transpose(final_image, axes_order)
-
-#     # Add back the batch dimension (N)
-#     return final_image_transposed[np.newaxis, ...], counts#, stitched_padded_image
-
-
-# import numpy as np
-# from pathlib import Path
-# from tqdm import tqdm
-# import os
-import pickle
-import time
-# from concurrent.futures import ThreadPoolExecutor, as_completed
-
-
-# import os
-import re
-# import pickle
-# from pathlib import Path
-from array import array
-# import time
 
 def get_pred_files(pred_dir, prefix="pred_", suffix=".npy", cache=True):
     """
