@@ -432,25 +432,47 @@ class MultiChDloader:
         patch_shape, grid_shape = self.get_idx_manager_shapes(
             self._img_sz, self._grid_sz
         )
+
         if self.sliding_window_flag:
+            if isinstance(self._grid_sz, int):  # 2D case
+                stride_val = grid_size // 8
+                stride_spatial = (stride_val, stride_val)
+            else:  # 3D case
+                stride_spatial = tuple(grid_size[i] // 8 for i in range(len(grid_size)))
+
+            print("From inside set_img_sz of multich_dataset.py:")
+            print(f"[{self.__class__.__name__}] Data Size {self._data.shape}")
+            print(f"[{self.__class__.__name__}] Image size (patch size): {self._img_sz}")
+            print(f"[{self.__class__.__name__}] Grid size: {self._grid_sz}")
+            print(f"[{self.__class__.__name__}] Using stride spatial: {stride_spatial}")
+
+            numC = self._data.shape[-1]
+            if self._5Ddata:
+                self.patch_shape = (1, self._depth3D, self._img_sz, self._img_sz, numC)
+                stride_full_shape = (1, *stride_spatial, 1)
+            else:
+                self.patch_shape = (1, self._img_sz, self._img_sz, numC)
+                stride_full_shape = (1, *stride_spatial, 1)
+
             self.idx_manager = WindowedTilingGridIndexManager(
                 data_shape=self._data.shape,
-                grid_shape = (1,self._grid_sz,self._grid_sz,2),
-                tiling_mode= TilingMode.ShiftBoundary,
-                padded_data_shape=self._data.shape,
-                patch_shape=(1,self._img_sz ,self._img_sz ,2),
-                stride=(1,4,4,1),
+                grid_shape=grid_shape,
+                patch_shape=patch_shape,
+                stride=stride_full_shape,
+                tiling_mode=self._tiling_mode
             )
+            print(f"[{self.__class__.__name__}] Windowed Index Manager initialized\n")
         else:   
             self.idx_manager = GridIndexManager(
                 shape, grid_shape, patch_shape, self._tiling_mode
             )
+
         # self.set_repeat_factor()
 
     def __len__(self):
-        # Vera: N is the number of frames in Z stack
-        # Repeat factor is n_rows * n_cols
-        return self.idx_manager.total_grid_count()
+        if hasattr(self, 'idx_manager') and hasattr(self.idx_manager, 'total_patch_count'):
+            return self.idx_manager.total_patch_count()
+        return self.N
 
     def set_repeat_factor(self):
         if self._grid_sz > 1:
