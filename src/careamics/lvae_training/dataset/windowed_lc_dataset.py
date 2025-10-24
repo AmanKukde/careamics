@@ -56,7 +56,7 @@ class WindowedLCDLoader(MultiChDloader):
         # After parent init, create scaled versions from padded data
         self._scaled_data = [self._padded_data]
         self._scaled_noise_data = [self._padded_noise_data]
-
+        
         assert (
             isinstance(self.multiscale_lowres_count, int)
             and self.multiscale_lowres_count >= 1
@@ -64,14 +64,14 @@ class WindowedLCDLoader(MultiChDloader):
         assert isinstance(self._padding_kwargs, dict)
         assert "mode" in self._padding_kwargs
 
-        print(f"[{self.__class__.__name__}] Creating {self.multiscale_lowres_count} scaled versions of padded data")
+        print(f"\n[{self.__class__.__name__}] Creating {self.multiscale_lowres_count} scaled versions of padded data")
         
         for _ in range(1, self.multiscale_lowres_count):
             shape = self._scaled_data[-1].shape
             assert len(shape) == 4
             new_shape = (shape[0], shape[1] // 2, shape[2] // 2, shape[3])
             
-            print(f"[{self.__class__.__name__}] Scale {len(self._scaled_data)}: Downsampling from {shape} to {new_shape}")
+            # print(f"[{self.__class__.__name__}] Scale {len(self._scaled_data)}: Downsampling from {shape} to {new_shape}")
             
             ds_data = resize(
                 self._scaled_data[-1].astype(np.float32), new_shape
@@ -92,7 +92,8 @@ class WindowedLCDLoader(MultiChDloader):
                 ).astype(self._scaled_noise_data[-1].dtype)
                 self._scaled_noise_data.append(noise_data)
         
-        print(f"[{self.__class__.__name__}] Finished creating scaled versions\n")
+        print(f"[{self.__class__.__name__}] Finished creating {self.multiscale_lowres_count} scaled versions for LC")
+        print(f"[{self.__class__.__name__}] Finished Windowed Tiling with {self.idx_manager.total_patch_count()} patches. ✅\n")
 
     def _pad_data(self, data, target_shape, noise_data=None):
         """
@@ -145,61 +146,126 @@ class WindowedLCDLoader(MultiChDloader):
         print(f"[{self.__class__.__name__}] Padded data shape: {padded_data.shape}")
         return padded_data, padded_noise_data
 
-    def get_padding_dimensions_and_shape(self, stride=None):
+    def get_padding_dimensions_and_shape(
+        self,
+        data_shape,
+        grid_sz,
+        stride=None,
+        boundary_discard_fraction=0.5,
+        is_5D=False
+    ):
         """
-        Compute per-edge padding and padded data shape for 2D/3D data,
-        using explicit stride if provided. Pads only as necessary to fit tiles.
-
+        Compute padding that accounts for:
+        1. Boundary padding needed to avoid edge artifacts during stitching
+        2. Additional padding to ensure the padded image can be properly tiled with stride
+        
         Args:
-            stride: list or tuple of ints [H, W] or [Z,H,W] to explicitly set step size.
-                    If None, it will be computed from grid_sz // sqrt(mmse_repetitions)
-
+            data_shape: tuple, shape of data (e.g., (N, H, W, C) or (N, Z, H, W, C))
+            grid_sz: int or list, tile size (e.g., 64 or [9, 64, 64])
+            stride: list or None, explicit stride per axis (if None, uses grid_sz // 8)
+            boundary_discard_fraction: float, fraction of tile that gets stitched 
+                                    (default 0.5 for center 50%)
+            is_5D: bool, whether data is 3D (5D array) or 2D (4D array)
+        
         Returns:
-            total_padding: list of ints, total padding per axis [H,W] or [Z,H,W]
-            padded_data_shape: tuple, new shape after padding
+            total_padding: list of ints, total padding per spatial axis
+            pad_width: list of tuples for np.pad format
+            padded_data_shape: tuple, shape after padding
+            boundary_pad: list of ints, the boundary padding component per axis
+        
+        Example:
+            For 2D with 64x64 tiles, stitching center 32x32:
+            >>> data_shape = (10, 512, 512, 1)
+            >>> total_pad, pad_width, padded_shape, boundary = \\
+            ...     get_padding_dimensions_and_shape_with_boundary_padding(
+            ...         data_shape, 64, [8, 8], 0.5, False)
+            >>> # boundary_pad = [16, 16] (half of discarded 32 pixels per side)
+            >>> # pad_width = [(0,0), (16,16), (16,16), (0,0)]
+            >>> # padded_shape = (10, 544, 544, 1)
+            
+            For 3D with 9x64x64 tiles, stitching center 9x32x32:
+            >>> data_shape = (5, 32, 256, 256, 1)
+            >>> total_pad, pad_width, padded_shape, boundary = \\
+            ...     get_padding_dimensions_and_shape_with_boundary_padding(
+            ...         data_shape, [9, 64, 64], [1, 8, 8], 0.5, True)
+            >>> # boundary_pad = [2, 16, 16] (half of discarded regions per side)
+            >>> # pad_width = [(0,0), (2,2), (16,16), (16,16), (0,0)]
         """
-        # --- Ensure grid size iterable ---
-        if self._5Ddata:
-            grid_sz = [self._grid_sz] * 3 if isinstance(self._grid_sz, int) else list(self._grid_sz)
-            spatial_dims = len(grid_sz)
+        
+        # Determine spatial dimensions
+        if is_5D:
+            grid_sz = [grid_sz] * 3 if isinstance(grid_sz, int) else list(grid_sz)
+            spatial_dims = 3
+            data_spatial_shape = data_shape[1:-1]  # (Z, H, W)
         else:
-            grid_sz = [self._grid_sz, self._grid_sz] if isinstance(self._grid_sz, int) else list(self._grid_sz)
+            grid_sz = [grid_sz] * 2 if isinstance(grid_sz, int) else list(grid_sz)
             spatial_dims = 2
-
-        # --- Use explicit stride or compute default ---
+            data_spatial_shape = data_shape[1:3]  # (H, W)
+        
+        # Compute stride
         if stride is not None:
             step_size = list(stride)
         else:
             step_size = [max(1, g // 8) for g in grid_sz]
-
-        # --- Compute number of tiles per axis (ceil division) ---
-        data_spatial_shape = self._data.shape[1:-1] if self._5Ddata else self._data.shape[1:3]
-        n_tiles = [
-            max(1, int(np.ceil((data_spatial_shape[i] - grid_sz[i]) / step_size[i])) + 1)
+        
+        # Compute boundary padding: half of the discarded region on each side
+        # If stitching center 50%, we discard 25% on each side
+        # So boundary_pad = tile_size * (1 - discard_fraction) / 2
+        boundary_pad = [int(g * (1 - boundary_discard_fraction) / 2) for g in grid_sz]
+        
+        # Add boundary padding to data shape
+        padded_for_boundary = [
+            data_spatial_shape[i] + 2 * boundary_pad[i] 
             for i in range(spatial_dims)
         ]
-
-        # --- Compute needed length along each axis ---
+        
+        # Now compute how many tiles we need for this boundary-padded shape
+        n_tiles = [
+            max(1, int(np.ceil((padded_for_boundary[i] - grid_sz[i]) / step_size[i])) + 1)
+            for i in range(spatial_dims)
+        ]
+        
+        # Compute the needed length to fit all tiles
         needed_length = [
             step_size[i] * (n_tiles[i] - 1) + grid_sz[i]
             for i in range(spatial_dims)
         ]
-
-        # --- Total padding needed ---
-        total_padding = [
-            max(0, needed_length[i] - data_spatial_shape[i])
+        
+        # Additional padding needed beyond boundary padding for stride alignment
+        extra_padding = [
+            max(0, needed_length[i] - padded_for_boundary[i])
             for i in range(spatial_dims)
         ]
-
-        # --- Compute padded shape ---
-        padded_shape_list = list(self._data.shape)
+        
+        # Total padding (boundary + extra for stride alignment)
+        total_padding = [
+            boundary_pad[i] * 2 + extra_padding[i] 
+            for i in range(spatial_dims)
+        ]
+        
+        # Distribute padding symmetrically
+        pad_per_side = []
+        for i in range(spatial_dims):
+            # Boundary padding is symmetric
+            left_pad = boundary_pad[i] + extra_padding[i] // 2
+            right_pad = boundary_pad[i] + (extra_padding[i] - extra_padding[i] // 2)
+            pad_per_side.append((left_pad, right_pad))
+        
+        # Construct pad_width for np.pad
+        # Format: [(N_before, N_after), (spatial_0_before, spatial_0_after), ..., (C_before, C_after)]
+        pad_width = [(0, 0)]  # No padding for N dimension
+        pad_width.extend(pad_per_side)  # Add spatial padding
+        pad_width.append((0, 0))  # No padding for C dimension
+        
+        # Compute final padded shape
+        padded_shape_list = list(data_shape)
         for i in range(spatial_dims):
             axis_idx = i + 1  # Skip N dimension
             padded_shape_list[axis_idx] += total_padding[i]
         padded_data_shape = tuple(padded_shape_list)
-
-        return total_padding, padded_data_shape
-
+        
+        return total_padding, padded_data_shape, pad_width, boundary_pad        
+    
     def set_img_sz(self, image_size, grid_size: Union[int, Tuple[int, int, int]]):
         """
         Overrides the parent method to set up padding and the WindowedTilingGridIndexManager.
@@ -231,12 +297,18 @@ class WindowedLCDLoader(MultiChDloader):
         else:
             self.patch_shape = (1, self._img_sz, self._img_sz, numC)
             stride_full_shape = (1, *stride_spatial, 1)  # (N, H, W, C)
-
+        
         # Calculate the padding amount and final padded shape
-        self.pad_amount_one_edge, self.padded_data_shape = self.get_padding_dimensions_and_shape(
-            stride=stride_spatial
-        )
-
+        boundary_discard_fraction = getattr(self, 'boundary_discard_fraction', 0.5)
+        
+        self.padding_amount, self.padded_data_shape, pad_width, boundary_pad = self.get_padding_dimensions_and_shape(
+                                                                                    data_shape = self._data.shape,
+                                                                                    grid_sz = self._grid_sz,stride =  stride_spatial,
+                                                                                    boundary_discard_fraction = boundary_discard_fraction,
+                                                                                    is_5D = self._5Ddata)
+        self.pad_width_spatial = pad_width[1:-1]  # Extract spatial padding only
+        self.boundary_pad = boundary_pad  # Store for later use in unpadding
+        
         # Pad the data
         self._padded_data, self._padded_noise_data = self._pad_data(
             data=self._data, target_shape=self.padded_data_shape, noise_data=self._noise_data
@@ -246,9 +318,9 @@ class WindowedLCDLoader(MultiChDloader):
             f"Expected padded shape {self.padded_data_shape}, got {self._padded_data.shape}"
         
         print(f"\n[{self.__class__.__name__}] Padded data shape: {self._padded_data.shape}, "
-              f"with padding of {self.pad_amount_one_edge} on each edge thus {[p*2 for p in self.pad_amount_one_edge]} in total")
+              f"with padding of {self.padding_amount} on each edge thus { np.sum(self.padding_amount)} in total")
         print(f"[{self.__class__.__name__}] Padded noise data shape: "
-              f"{self._padded_noise_data.shape if self._noise_data is not None else 'None'}")
+              f"{self._padded_noise_data.shape if self._noise_data is not None else 'None'}\n")
 
         # Initialize our special windowed index manager
         self.idx_manager = WindowedTilingGridIndexManager(
@@ -260,7 +332,6 @@ class WindowedLCDLoader(MultiChDloader):
             stride=stride_full_shape,
         )
 
-        print(f"[{self.__class__.__name__}] Finished Windowed Tiling with {self.idx_manager.total_patch_count()} patches.\n")
 
     def reduce_data(
         self, t_list=None, h_start=None, h_end=None, w_start=None, w_end=None
