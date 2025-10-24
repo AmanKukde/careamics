@@ -20,7 +20,7 @@ from tqdm import tqdm
 from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
 from careamics.utils.metrics import scale_invariant_psnr
-
+from pathlib import Path
 import pdb
 from usplit.analysis.lvae_utils import get_img_from_forward_output
 
@@ -1143,7 +1143,7 @@ def stitch_predictions_general(predictions, dset):
 # import os
 import pickle
 import time
-# from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # import os
@@ -1231,7 +1231,7 @@ def stitch_and_crop_predictions_inner_tile_from_dir(
     use_memmap=False,
     skip_missing=True,
     num_channels=2,
-    debug=True,  # <-- new parameter
+    debug=False,  # <-- new parameter
 ):
     """
     Stitch patch predictions (tiles) into a full image.
