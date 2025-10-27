@@ -1071,7 +1071,7 @@ def stitch_and_crop_predictions_inner_tile_from_dir(
     use_memmap=False,
     skip_missing=True,
     num_channels=2,
-    debug=True,  # <-- new parameter
+    debug=False,  
 ):
     """
     Stitch patch predictions (tiles) into a full image.
