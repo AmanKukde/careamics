@@ -8,7 +8,6 @@ It includes functions to:
 
 import os
 from typing import Optional, Union, Iterator, Tuple, List
-import dill
 import matplotlib
 import matplotlib.pyplot as plt
 import torch
@@ -16,14 +15,9 @@ from matplotlib.gridspec import GridSpec
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
-import pdb
 from usplit.analysis.lvae_utils import get_img_from_forward_output
-import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
-from time import time
-import re
-import array
 
 from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
@@ -491,7 +485,6 @@ def get_predictions(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
-    sliding_window_flag = False,
 ) -> tuple[dict, dict, dict]:
     """Get patch-wise predictions from a model for the entire dataset.
 
@@ -525,7 +518,7 @@ def get_predictions(
         multifile_stitched_predictions = {}
         multifile_stitched_stds = {}
         for d in dset.dsets:
-            stitched_predictions, stitched_stds, *counts = get_single_file_mmse(
+            stitched_predictions, stitched_stds = get_single_file_mmse(
                 model=model,
                 dset=d,
                 batch_size=batch_size,
@@ -533,7 +526,6 @@ def get_predictions(
                 grid_size=grid_size,
                 mmse_count=mmse_count,
                 num_workers=num_workers,
-                sliding_window_flag = sliding_window_flag,
             )
             # get filename without extension and path
             filename = d._fpath.name
@@ -544,7 +536,7 @@ def get_predictions(
             multifile_stitched_stds,
         )
     else:
-        stitched_predictions, stitched_stds, *counts = get_single_file_mmse(
+        stitched_predictions, stitched_stds = get_single_file_mmse(
             model=model,
             dset=dset,
             batch_size=batch_size,
@@ -552,23 +544,16 @@ def get_predictions(
             grid_size=grid_size,
             mmse_count=mmse_count,
             num_workers=num_workers,
-            sliding_window_flag = sliding_window_flag,
         )
         # TODO stitching still not working properly for weirdly shaped images
         # get filename without extension and path
         # TODO in the ref ds this is the name of a folder not file :(
         filename = dset._fpath.name
-        if len(counts)>0:
-            return (
-                {filename: stitched_predictions},
-                {filename: stitched_stds},
-                {filename: counts[0]},
-                {filename: counts[1]},
-            )
         return (
             {filename: stitched_predictions},
-            {filename: stitched_stds}
+            {filename: stitched_stds},
         )
+
 
 def get_single_file_predictions(
     model: VAEModule,
@@ -617,6 +602,7 @@ def get_single_file_predictions(
     tile_samples = np.concatenate(tiles, axis=0)
     return stitch_predictions_new(tile_samples, dset)
 
+
 def get_single_file_mmse(
     model: VAEModule,
     dset: Dataset,
@@ -625,7 +611,6 @@ def get_single_file_mmse(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
-    sliding_window_flag = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get patch-wise predictions from a model for a single file dataset."""
     device = get_device()
@@ -637,8 +622,8 @@ def get_single_file_mmse(
         shuffle=False,
         batch_size=batch_size,
     )
-    # if tile_size and grid_size:
-    #     dset.set_img_sz(tile_size, grid_size)
+    if tile_size and grid_size:
+        dset.set_img_sz(tile_size, grid_size)
 
     model.eval()
     model.to(device)
@@ -677,27 +662,14 @@ def get_single_file_mmse(
     tiles_arr = np.concatenate(tile_mmse, axis=0)
     tile_stds = np.concatenate(tile_stds, axis=0)
     # TODO temporary hack, because of the stupid jupyter!
-    
     # If a user reruns a cell with class definition, isinstance will return False
     if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
         stitch_func = stitch_predictions_general
     else:
         stitch_func = stitch_predictions_new
-        
-    if sliding_window_flag:
-        stitch_func = stitch_and_crop_predictions_inner_tile
-    
-    print(f"Using {stitch_func}")
-
-    if sliding_window_flag:
-        stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
-        stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
-        return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
     stitched_predictions = stitch_func(tiles_arr, dset)
     stitched_stds = stitch_func(tile_stds, dset)
     return stitched_predictions, stitched_stds
-
-
 
 def get_single_file_mmse_usplit(
     model: VAEModule,
@@ -772,7 +744,6 @@ def get_single_file_mmse_usplit(
     stitched_predictions = stitch_func(tiles_arr, dset)
     stitched_stds = stitch_func(tile_stds, dset)
     return stitched_predictions, stitched_stds
-
 
 # ------------------------------------------------------------------------------------------
 ### Classes and Functions used to stitch predictions
@@ -1068,72 +1039,6 @@ def stitch_predictions_general(predictions, dset):
 
     return output
 
-
-def get_pred_files(pred_dir, prefix="pred_", suffix=".npy", cache=True):
-    """
-    Efficiently discover sequentially numbered prediction files, sorted by numeric index.
-
-    Works even if:
-      - Indices start at a high number
-      - There are gaps in numbering
-      - Cache exists but is corrupted
-      - Millions of files are present
-
-    Args:
-        pred_dir (str or Path): Directory containing prediction files.
-        prefix (str): Filename prefix (default 'pred_').
-        suffix (str): Filename suffix (default '.npy').
-        cache (bool): Whether to use/save a cache file for speed.
-
-    Returns:
-        List[Path]: Sorted list of prediction file paths.
-    """
-    pred_dir = Path(pred_dir)
-    cache_path = pred_dir / "pred_file_cache.pkl"
-
-    # Try cache first
-    if cache and cache_path.exists():
-        try:
-            files = pickle.load(open(cache_path, "rb"))
-            if files:
-                print(f"✅ Loaded {len(files)} files from cache.")
-                return files
-        except Exception:
-            print("⚠️ Cache corrupted or unreadable. Rebuilding...")
-
-    t0 = time.time()
-    pattern = re.compile(rf"{prefix}(\d+){suffix}$")
-    matches = array('I')  # store indices efficiently
-    paths = []
-
-    # Efficient directory scan
-    with os.scandir(pred_dir) as it:
-        for entry in it:
-            if not entry.is_file():
-                continue
-            m = pattern.match(entry.name)
-            if m:
-                idx = int(m.group(1))
-                matches.append(idx)
-                paths.append((idx, Path(entry.path)))
-
-    if not matches:
-        raise RuntimeError(f"No prediction files found in {pred_dir}")
-
-    # Sort by numeric index
-    sorted_pairs = sorted(zip(matches, paths), key=lambda x: x[0])
-    files = [p for _, p in sorted_pairs]
-
-    # Save cache
-    if cache:
-        try:
-            pickle.dump(files, open(cache_path, "wb"))
-        except Exception:
-            print("⚠️ Failed to write cache. Ignoring.")
-
-    print(f"✅ Found {len(files)} prediction files in {time.time() - t0:.2f}s")
-    return files
-
 def stitch_and_crop_predictions_inner_tile(predictions, dset):
     """
     Stitch only the inner centered tile from each prediction patch into the big canvas,
@@ -1276,31 +1181,6 @@ def stitch_predictions_windowed_from_dir(
                     try:
                         arr = fut.result()
                         progress_counter += 1
-
-                        # Live-stitching checkpoint
-                        # if (
-                        #     live_stitching
-                        #     and progress_counter >= next_dump_threshold
-                        # ):
-                        #     dump_count += 1
-                        #     timestamp = datetime.now().strftime("%H%M%S")
-                        #     out_path = live_dir / f"stitched_{dump_count:03d}_{timestamp}.png"
-
-                        #     # Create current snapshot
-                        #     partial = np.copy(stitched / np.maximum(counts, 1))
-                        #     plt.imshow(partial.squeeze(), cmap="gray")
-                        #     plt.title(f"{progress_counter}/{num_patches} patches ({100 * progress_counter / num_patches:.1f}%)")
-                        #     plt.axis("off")
-                        #     plt.savefig(out_path, bbox_inches="tight", dpi=150)
-                        #     plt.close()
-
-                        #     if debug:
-                        #         print(f"[LIVE] Dumped partial stitch at {out_path}")
-
-                        #     next_dump_threshold = progress_counter + int(
-                        #         num_patches * live_interval_percent / 100
-                        #     )
-
                         yield arr
 
                     except Exception as e:
@@ -1529,20 +1409,6 @@ def stitch_predictions_windowed_highperf(
 
     return (final_image, coverage_mask) if return_coverage_mask else final_image
 
-
-def cleanup_memmap_files(pred_dir):
-    """
-    Clean up temporary memmap files created during stitching.
-    
-    Args:
-        pred_dir: Directory containing the memmap files
-    """
-    pred_dir = Path(pred_dir)
-    for tmp_file in ["stitched_tmp.dat", "counts_tmp.dat"]:
-        tmp_path = pred_dir / tmp_file
-        if tmp_path.exists():
-            tmp_path.unlink()
-            print(f"[INFO] Deleted {tmp_path}")
 
 def stitch_predictions_windowed(
     generator: Iterator[np.ndarray],
@@ -1888,19 +1754,3 @@ def analyze_coverage(coverage_mask: np.ndarray, debug: bool = True) -> dict:
         print("=" * 60 + "\n")
     
     return stats
-
-
-def find_uncovered_regions(coverage_mask: np.ndarray, threshold: int = 1) -> np.ndarray:
-    """
-    Find regions with insufficient coverage.
-    
-    Args:
-        coverage_mask: Output from stitch_predictions_windowed
-        threshold: Pixels with coverage < threshold are considered uncovered
-    
-    Returns:
-        Boolean mask of uncovered regions
-    """
-    return coverage_mask < threshold
-
-
