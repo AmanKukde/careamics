@@ -461,7 +461,7 @@ class MultiChDloader:
                 stride=stride_full_shape,
                 tiling_mode=self._tiling_mode
             )
-            print(f"[{self.__class__.__name__}] Windowed Index Manager initialized\n")
+            print(f"[{self.__class__.__name__}] Windowed Index Manager initialisation complete\n")
         else:   
             self.idx_manager = GridIndexManager(
                 shape, grid_shape, patch_shape, self._tiling_mode
@@ -472,6 +472,8 @@ class MultiChDloader:
     def __len__(self):
         if hasattr(self, 'idx_manager') and hasattr(self.idx_manager, 'total_patch_count'):
             return self.idx_manager.total_patch_count()
+        elif hasattr(self, 'idx_manager') and hasattr(self.idx_manager, 'total_grid_count'):
+            return self.idx_manager.total_grid_count()
         return self.N
 
     def set_repeat_factor(self):
@@ -723,6 +725,8 @@ class MultiChDloader:
         """
         loc_list = self.idx_manager.get_patch_location_from_dataset_idx(index)
         # last dim is channel. we need to take the third and the second last element.
+        if self._5Ddata:
+            return loc_list[0:3]
         return loc_list[1:3]
 
     def compute_individual_mean_std(self):
