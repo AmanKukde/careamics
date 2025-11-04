@@ -64,7 +64,7 @@ class MultiChDloader:
             allow_generation=data_config.allow_generation,
         )
         self._normalized_input = data_config.normalized_input
-        self._quantile = 0.995
+        self._quantile = 1.0
         self._channelwise_quantile = False
         self._background_quantile = 0.0
         self._clip_background_noise_to_zero = False
@@ -385,7 +385,7 @@ class MultiChDloader:
             if w_end is None:
                 w_end = self._data.shape[2]
             print(f"Inside [{self.__class__.__name__}] Reducing data to t_list: {t_list}")
-            self._data = self._data[t_list, h_start:h_end, w_start:w_end, :] .copy()
+            self._data = self._data[t_list, h_start:h_end, w_start:w_end, :].copy()
             if self._noise_data is not None:
                 self._noise_data = self._noise_data[
                     t_list, h_start:h_end, w_start:w_end, :
@@ -466,7 +466,6 @@ class MultiChDloader:
             self.idx_manager = GridIndexManager(
                 shape, grid_shape, patch_shape, self._tiling_mode
             )
-
         # self.set_repeat_factor()
 
     def __len__(self):
@@ -727,8 +726,8 @@ class MultiChDloader:
         # last dim is channel. we need to take the third and the second last element.
         if self._5Ddata:
             return loc_list[0:3]
-        return loc_list[1:3]
-
+        # return loc_list[1:-1]#!AMAN CHECK WHICH IS CORRECT for SW and OG both
+        return loc_list[1:3] 
     def compute_individual_mean_std(self):
         # numpy 1.19.2 has issues in computing for large arrays. https://github.com/numpy/numpy/issues/8869
         # mean = np.mean(self._data, axis=(0, 1, 2))
