@@ -1482,7 +1482,7 @@ def stitch_predictions_windowed(
     # ========================================================================
     # Get dimensions from dataset (UNPADDED)
     # ========================================================================
-    original_shape = dset._data.shape
+    original_shape = dset._data[...,dset._tar_idx_list].shape
     idx_manager = dset.idx_manager
     
     # Determine if 2D or 3D from patch_spatial_dims

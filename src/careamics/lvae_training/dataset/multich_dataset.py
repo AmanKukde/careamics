@@ -723,11 +723,12 @@ class MultiChDloader:
         It returns the top-left corner of the patch corresponding to index.
         """
         loc_list = self.idx_manager.get_patch_location_from_dataset_idx(index)
-        # last dim is channel. we need to take the third and the second last element.
+
         if self._5Ddata:
-            return loc_list[1:-1] #!CHECK FOR 3D
+            return loc_list[1:4] #!CHECK FOR 3D
         # return loc_list[1:-1]#!AMAN CHECK WHICH IS CORRECT for SW and OG both
-        return loc_list[1:-1] 
+        return loc_list[1:3] 
+
     def compute_individual_mean_std(self):
         # numpy 1.19.2 has issues in computing for large arrays. https://github.com/numpy/numpy/issues/8869
         # mean = np.mean(self._data, axis=(0, 1, 2))
