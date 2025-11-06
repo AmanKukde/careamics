@@ -15,7 +15,7 @@ from matplotlib.gridspec import GridSpec
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 from pathlib import Path
-from usplit.analysis.lvae_utils import get_img_from_forward_output
+# from usplit.analysis.lvae_utils import get_img_from_forward_output
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import warnings
 
@@ -671,81 +671,81 @@ def get_single_file_mmse(
     stitched_stds = stitch_func(tile_stds, dset)
     return stitched_predictions, stitched_stds
 
-def get_single_file_mmse_usplit(
-    model: VAEModule,
-    dset: Dataset,
-    batch_size: int,
-    tile_size: Optional[tuple[int, int]] = None,
-    grid_size: Optional[int] = None,
-    mmse_count: int = 1,
-    num_workers: int = 4,
-    sliding_window_flag = False,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Get patch-wise predictions from a model for a single file dataset."""
-    device = get_device()
+# def get_single_file_mmse_usplit(
+#     model: VAEModule,
+#     dset: Dataset,
+#     batch_size: int,
+#     tile_size: Optional[tuple[int, int]] = None,
+#     grid_size: Optional[int] = None,
+#     mmse_count: int = 1,
+#     num_workers: int = 4,
+#     sliding_window_flag = False,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     """Get patch-wise predictions from a model for a single file dataset."""
+#     device = get_device()
 
-    dloader = DataLoader(
-        dset,
-        pin_memory=False,
-        num_workers=num_workers,
-        shuffle=False,
-        batch_size=batch_size,
-    )
-    # if tile_size and grid_size:
-    #     dset.set_img_sz(tile_size, grid_size)
+#     dloader = DataLoader(
+#         dset,
+#         pin_memory=False,
+#         num_workers=num_workers,
+#         shuffle=False,
+#         batch_size=batch_size,
+#     )
+#     # if tile_size and grid_size:
+#     #     dset.set_img_sz(tile_size, grid_size)
 
-    model.eval()
-    model.to(device)
-    tile_mmse = []
-    tile_stds = []
-    # logvar_arr = []
-    with torch.no_grad():
-        for batch in tqdm(dloader, desc="Predicting tiles"):
-            inp, tar = batch
-            inp = inp.to(device)
-            tar = tar.to(device)
+#     model.eval()
+#     model.to(device)
+#     tile_mmse = []
+#     tile_stds = []
+#     # logvar_arr = []
+#     with torch.no_grad():
+#         for batch in tqdm(dloader, desc="Predicting tiles"):
+#             inp, tar = batch
+#             inp = inp.to(device)
+#             tar = tar.to(device)
 
-            rec_img_list = []
-            for _ in range(mmse_count):
-                # get model output
-                rec, _ = model(inp)
-                rec = get_img_from_forward_output(rec,model) 
-                # get reconstructed img
-                # pdb.set_trace()
-                rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
+#             rec_img_list = []
+#             for _ in range(mmse_count):
+#                 # get model output
+#                 rec, _ = model(inp)
+#                 rec = get_img_from_forward_output(rec,model) 
+#                 # get reconstructed img
+#                 # pdb.set_trace()
+#                 rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
 
-            # aggregate results
-            # pdb.set_trace()
-            samples = torch.cat(rec_img_list, dim=0)
-            mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
-            std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
+#             # aggregate results
+#             # pdb.set_trace()
+#             samples = torch.cat(rec_img_list, dim=0)
+#             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
+#             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
 
-            tile_mmse.append(mmse_imgs.cpu().numpy())
-            tile_stds.append(std_imgs.cpu().numpy())
+#             tile_mmse.append(mmse_imgs.cpu().numpy())
+#             tile_stds.append(std_imgs.cpu().numpy())
 
-    tiles_arr = np.concatenate(tile_mmse, axis=0)
-    tile_stds = np.concatenate(tile_stds, axis=0)
-    # TODO temporary hack, because of the stupid jupyter!
+#     tiles_arr = np.concatenate(tile_mmse, axis=0)
+#     tile_stds = np.concatenate(tile_stds, axis=0)
+#     # TODO temporary hack, because of the stupid jupyter!
     
-    # If a user reruns a cell with class definition, isinstance will return False
-    if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
-        stitch_func = stitch_predictions_general
-    else:
-        stitch_func = stitch_predictions_new
-    if sliding_window_flag:
-        stitch_func = stitch_and_crop_predictions_inner_tile
+#     # If a user reruns a cell with class definition, isinstance will return False
+#     if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
+#         stitch_func = stitch_predictions_general
+#     else:
+#         stitch_func = stitch_predictions_new
+#     if sliding_window_flag:
+#         stitch_func = stitch_and_crop_predictions_inner_tile
     
-    print(f"Using {stitch_func}")
+#     print(f"Using {stitch_func}")
 
-    if sliding_window_flag:
-        stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
-        stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
-        return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
-    stitched_predictions = stitch_func(tiles_arr, dset)
-    stitched_stds = stitch_func(tile_stds, dset)
-    return stitched_predictions, stitched_stds
+#     if sliding_window_flag:
+#         stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
+#         stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
+#         return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
+#     stitched_predictions = stitch_func(tiles_arr, dset)
+#     stitched_stds = stitch_func(tile_stds, dset)
+#     return stitched_predictions, stitched_stds
 
-# ------------------------------------------------------------------------------------------
+# # ------------------------------------------------------------------------------------------
 ### Classes and Functions used to stitch predictions
 class PatchLocation:
     """
