@@ -1413,7 +1413,6 @@ def stitch_predictions_windowed_highperf(
 def stitch_predictions_windowed(
     generator: Iterator[np.ndarray],
     dset,
-    num_patches: int,
     inner_fraction: Union[float, List[float]] = 0.5,
     debug: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -1482,9 +1481,12 @@ def stitch_predictions_windowed(
     # ========================================================================
     # Get dimensions from dataset (UNPADDED)
     # ========================================================================
-    original_shape = dset._data[...,dset._tar_idx_list].shape
+    if getattr(dset, '_tar_idx_list', None):
+        original_shape = dset._data[...,dset._tar_idx_list].shape
+    else:
+        original_shape = dset._data.shape
     idx_manager = dset.idx_manager
-    
+    num_patches = len(dset)
     # Determine if 2D or 3D from patch_spatial_dims
     patch_spatial_dims = idx_manager.patch_spatial_dims
     num_spatial_dims = len(patch_spatial_dims)
