@@ -46,10 +46,18 @@ def stitch_prediction(
     ]
     image_predictions = []
     # slice the lists and apply stitch_prediction_single to each in turn.
-    for image_slice in image_slices:
-        image_predictions.append(
-            stitch_prediction_single(tiles[image_slice], tile_infos[image_slice])
-        )
+    swt = False
+    # swt = False
+    if swt == False:
+        for image_slice in image_slices:
+            image_predictions.append(
+                stitch_prediction_single(tiles[image_slice], tile_infos[image_slice])
+            )
+    else:
+        for image_slice in image_slices:
+            image_predictions.append(
+                stitch_prediction_single_(tiles[image_slice], tile_infos[image_slice])
+            )
     return image_predictions
 
 
@@ -110,3 +118,85 @@ def stitch_prediction_single(
         predicted_image[image_slices] = cropped_tile.astype(np.float32)
 
     return predicted_image
+
+
+from typing import List
+import numpy as np
+
+def stitch_prediction_single_(
+    tiles: List[np.ndarray],
+    tile_infos: List['TileInformation'],
+    inner_fraction: float = 0.5
+) -> np.ndarray:
+    """
+    Stitches tiles into a full prediction, handling both 3D (SYX) and 4D (N,Y,X) outputs.
+    
+    Args:
+        tiles: List of tile arrays. Can be 2D, 3D, or 4D (with leading singleton axes)
+        tile_infos: List of TileInformation with source_crop_coords ((y0,y1),(x0,x1))
+        inner_fraction: Fraction of the tile to use as the central crop (square)
+    
+    Returns:
+        pred_img: Stitched prediction array
+    """
+
+    # Determine output shape from first tile_info
+    out_shape = tile_infos[0].array_shape
+    pred_img = np.zeros(out_shape, dtype=np.float32)
+    coverage = np.zeros(out_shape, dtype=np.float32)
+
+    for i, (tile, info) in enumerate(zip(tiles, tile_infos)):
+        # ---- Identify spatial axes ----
+        spatial_axes = tile.shape[-len(info.source_crop_coords):]  # last axes are spatial
+        num_spatial = len(spatial_axes)
+
+        # ---- Determine square inner crop ----
+        min_spatial = min(spatial_axes)
+        crop_len = max(1, int(round(min_spatial * inner_fraction)))
+
+        # ---- Build crop slices ----
+        # Start with leading axes (batch, channel) if any
+        crop_slices = [slice(None)] * (tile.ndim - num_spatial)
+        out_slices = [slice(None)] * (pred_img.ndim - num_spatial)
+
+        for ax, (src_start, src_end) in enumerate(info.source_crop_coords):
+            axis_len = spatial_axes[ax]
+            start = (axis_len - crop_len) // 2
+            end = start + crop_len
+            crop_slices.append(slice(start, end))
+            out_slices.append(slice(src_start + start, src_start + end))
+
+        # ---- Extract inner tile ----
+        inner_tile = tile[tuple(crop_slices)]
+
+        # ---- Squeeze extra leading singleton axes to match pred_img ----
+        while inner_tile.ndim > pred_img.ndim:
+            inner_tile = np.squeeze(inner_tile, axis=0)
+
+        # ---- Debug prints ----
+        print(f"\n--- Tile {i} ---")
+        print(f"Tile shape: {tile.shape}")
+        print(f"Spatial axes: {spatial_axes}")
+        print(f"Source crop coords: {info.source_crop_coords}")
+        print(f"Crop slices: {crop_slices}")
+        print(f"Output slices: {out_slices}")
+        print(f"Inner tile shape after squeeze: {inner_tile.shape}")
+        try:
+            out_region_shape = pred_img[tuple(out_slices)].shape
+            print(f"Output region shape: {out_region_shape}")
+        except IndexError as e:
+            print(f"IndexError accessing pred_img with out_slices: {e}")
+            continue
+
+        # ---- Skip if shapes do not match ----
+        if inner_tile.shape != out_region_shape:
+            print(f"[SKIP] Shape mismatch: inner_tile {inner_tile.shape}, output {out_region_shape}")
+            continue
+
+        # ---- Add to prediction and track coverage ----
+        pred_img[tuple(out_slices)] += inner_tile
+        coverage[tuple(out_slices)] += 1
+
+    # ---- Average overlapping regions ----
+    pred_img = pred_img / np.maximum(coverage, 1)
+    return pred_img

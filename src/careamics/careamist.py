@@ -666,7 +666,7 @@ class CAREamist:
             raise ValueError(
                 "Mean and std must be provided in the configuration. \n Likely reason is that model was not trained"
             )
-
+        
         # tile size for UNets
         if tile_size is not None:
             model = self.cfg.algorithm_config.model
