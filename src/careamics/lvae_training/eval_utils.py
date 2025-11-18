@@ -711,11 +711,11 @@ def get_single_file_mmse(
 #                 rec, _ = model(inp)
 #                 rec = get_img_from_forward_output(rec,model) 
 #                 # get reconstructed img
-#                 # pdb.set_trace()
+#                 # 
 #                 rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
 
 #             # aggregate results
-#             # pdb.set_trace()
+#             # 
 #             samples = torch.cat(rec_img_list, dim=0)
 #             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
 #             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
@@ -1486,6 +1486,7 @@ def stitch_predictions_windowed(
     else:
         original_shape = dset._data.shape
     idx_manager = dset.idx_manager
+    print(idx_manager)
     num_patches = len(dset)
     # Determine if 2D or 3D from patch_spatial_dims
     patch_spatial_dims = idx_manager.patch_spatial_dims
@@ -1645,7 +1646,21 @@ def stitch_predictions_windowed(
                 # Add to canvas
                 stitched[batch_idx, z_start_inner:z_end_inner, h_start_inner:h_end_inner, w_start_inner:w_end_inner, :] += inner_pred_inner_cropped
                 counts[batch_idx, z_start_inner:z_end_inner, h_start_inner:h_end_inner, w_start_inner:w_end_inner, :] += 1
-                
+                # -----------------------------------------------------------
+                # Optional periodic save every 1000 patches (debug checkpoint)
+                # -----------------------------------------------------------
+                if patch_idx % 100 == 0 and patch_idx > 0:
+                    try:
+                        import tifffile
+                        save_path = "/group/jug/aman/my3dimg.tiff"
+                        # Average overlapping regions before saving
+                        temp_stitched = stitched / np.maximum(counts, 1)
+                        tifffile.imwrite(save_path, temp_stitched.astype(np.float32))
+                        if debug:
+                            print(f"[DEBUG] Saved intermediate averaged TIFF at patch {patch_idx} → {save_path}")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to save checkpoint TIFF at patch {patch_idx}: {e}")
+
             else:
                 # loc = (N, H, W)
                 h_start, w_start = loc[1], loc[2]
@@ -1714,45 +1729,3 @@ def stitch_predictions_windowed(
     coverage_mask = counts
     
     return stitched, coverage_mask
-
-
-# ============================================================================
-# Utility Functions for Coverage Analysis
-# ============================================================================
-
-def analyze_coverage(coverage_mask: np.ndarray, debug: bool = True) -> dict:
-    """
-    Analyze the coverage of stitched predictions.
-    
-    Args:
-        coverage_mask: Output from stitch_predictions_windowed
-        debug: Print analysis
-    
-    Returns:
-        Dictionary with coverage statistics
-    """
-    # Find non-zero coverage
-    non_zero = coverage_mask > 0
-    
-    stats = {
-        "total_pixels": coverage_mask.size,
-        "covered_pixels": np.sum(non_zero),
-        "uncovered_pixels": np.sum(~non_zero),
-        "coverage_percentage": 100 * np.sum(non_zero) / coverage_mask.size,
-        "min_coverage": np.min(coverage_mask[non_zero]) if np.any(non_zero) else 0,
-        "max_coverage": np.max(coverage_mask),
-        "mean_coverage": np.mean(coverage_mask[non_zero]) if np.any(non_zero) else 0,
-    }
-    
-    if debug:
-        print("\n" + "=" * 60)
-        print("Coverage Analysis")
-        print("=" * 60)
-        print(f"Total pixels: {stats['total_pixels']:,}")
-        print(f"Covered pixels: {stats['covered_pixels']:,} ({stats['coverage_percentage']:.1f}%)")
-        print(f"Uncovered pixels: {stats['uncovered_pixels']:,}")
-        print(f"Coverage range: {stats['min_coverage']:.1f} - {stats['max_coverage']:.1f}")
-        print(f"Mean coverage: {stats['mean_coverage']:.2f}")
-        print("=" * 60 + "\n")
-    
-    return stats
