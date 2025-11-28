@@ -403,7 +403,7 @@ class MultiChDloader:
         if self._5Ddata:
             patch_shape = (1, self._depth3D, patch_size, patch_size, numC)
             if isinstance(grid_size, int):
-                grid_shape = (1, 1, grid_size, grid_size, numC)
+                grid_shape = (1, self._depth3D, grid_size, grid_size, numC) #!HARD CODED HERE 
             else:
                 assert len(grid_size) == 3
                 assert all(
@@ -439,11 +439,12 @@ class MultiChDloader:
                 stride_spatial = (stride_val, stride_val)
             else:  # 3D case
                 stride_spatial = tuple(grid_size[i] // 8 for i in range(len(grid_size)))
+                # stride_spatial = (3,4,4) #!HARDCODED
 
             print("From inside set_img_sz of multich_dataset.py:")
             print(f"[{self.__class__.__name__}] Data Size {self._data.shape}")
             print(f"[{self.__class__.__name__}] Image size (patch size): {self._img_sz}")
-            print(f"[{self.__class__.__name__}] Grid size: {self._grid_sz}")
+            print(f"[{self.__class__.__name__}] Grid size: {grid_shape}")
             print(f"[{self.__class__.__name__}] Using stride spatial: {stride_spatial}")
 
             numC = self._data.shape[-1]
@@ -725,8 +726,7 @@ class MultiChDloader:
         loc_list = self.idx_manager.get_patch_location_from_dataset_idx(index)
 
         if self._5Ddata:
-            return loc_list[1:4] #!CHECK FOR 3D
-        # return loc_list[1:-1]#!AMAN CHECK WHICH IS CORRECT for SW and OG both
+            return loc_list[1:]
         return loc_list[1:3] 
 
     def compute_individual_mean_std(self):

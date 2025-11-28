@@ -186,12 +186,13 @@ def stitch_predictions_3d(
         patch_spatial_dims, inner_fractions
     )
 
-    patch_idx = 0
-    for pred in tqdm(generator, total=num_patches):
+    # patch_idx = 0
+    for output in tqdm(enumerate(generator), total=num_patches):
+        patch_idx, pred = output
         if patch_idx >= num_patches:
             break
-
         pred = _ensure_channel_last(pred, is_3d=True)
+
         loc = idx_manager.get_patch_location_from_dataset_idx(patch_idx)
 
         _apply_crop_and_stitch_3d(
@@ -200,8 +201,8 @@ def stitch_predictions_3d(
             original_shape
         )
 
-        patch_idx += 1
-        if debug and patch_idx%1000 == 0:
+        # patch_idx += 1
+        if debug and patch_idx%100 == 0:
             intermediate =  stitched/np.maximum(1,counts)
             tf.imwrite("my_image.tiff",intermediate.transpose(0,4,1,2,3))
     counts[counts == 0] = 1
