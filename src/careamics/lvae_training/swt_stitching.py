@@ -5,51 +5,71 @@ import matplotlib.pyplot as plt
 import tifffile as tf
 
 # ============================================================
-# Helper utilities
+# Helper Utilities
 # ============================================================
 
 def _parse_inner_fractions(inner_fraction, num_dims: int):
-    """Convert inner_fraction into a per-axis list."""
     if isinstance(inner_fraction, (int, float)):
         return [inner_fraction] * num_dims
     if isinstance(inner_fraction, (list, tuple)):
         if len(inner_fraction) != num_dims:
-            raise ValueError(
-                f"Expected {num_dims} inner fractions, got {len(inner_fraction)}."
-            )
+            raise ValueError(f"Expected {num_dims} inner fractions, got {len(inner_fraction)}")
         return list(inner_fraction)
-    raise TypeError("inner_fraction must be float or list.")
+    raise TypeError("inner_fraction must be float or list")
 
 
 def _compute_inner_crop_params(patch_spatial_dims, inner_fractions):
-    """Compute start/end crop indices and inner tile sizes per axis."""
-    start = []
-    end = []
-    size = []
+    start, end, size = [], [], []
     for full, frac in zip(patch_spatial_dims, inner_fractions):
         inner_size = int(full * frac)
         s = (full - inner_size) // 2
         e = s + inner_size
-        size.append(inner_size)
         start.append(s)
         end.append(e)
+        size.append(inner_size)
     return start, end, size
 
 
+def compute_needed_patch_indices(
+    dataset_shape,   # (Z, Y, X)
+    patch_size,      # (Zp, Yp, Xp)
+    stride,          # (Zs, Ys, Xs)
+    pad_per_side     # (Zpad, Ypad, Xpad)
+):
+    Zdim, Ydim, Xdim = dataset_shape
+    Zp, Yp, Xp = patch_size
+    Zs, Ys, Xs = stride
+    Zpad, Ypad, Xpad = pad_per_side
+
+    # Compute start coords of all patches in each dimension
+    z_starts = np.arange(0, Zdim - Zp + 1, Zs)
+    y_starts = np.arange(0, Ydim - Yp + 1, Ys)
+    x_starts = np.arange(0, Xdim - Xp + 1, Xs)
+
+    # Keep only patches that overlap valid (non-padded) area
+    z_valid = np.where((z_starts + Zp > Zpad) & (z_starts < Zdim - Zpad))[0]
+    y_valid = np.where((y_starts + Yp > Ypad) & (y_starts < Ydim - Ypad))[0]
+    x_valid = np.where((x_starts + Xp > Xpad) & (x_starts < Xdim - Xpad))[0]
+
+    # Compute the cartesian product of valid patch indices
+    zz, yy, xx = np.meshgrid(z_valid, y_valid, x_valid, indexing="ij")
+    # Flatten and convert to linear indices
+    patch_indices = (zz * len(y_starts) * len(x_starts) + yy * len(x_starts) + xx).ravel()
+
+    return patch_indices.astype(int)
+
+
+
 def _ensure_channel_last(pred: np.ndarray, is_3d: bool):
-    """Convert prediction to channel-last format."""
+    """Convert prediction to channel-last format"""
     if is_3d:
-        # Expect (Z,H,W,C). If (C,Z,H,W) swap.
         if pred.ndim == 4 and pred.shape[0] < min(pred.shape[1:]):
-            return np.transpose(pred, (1, 2, 3, 0))
+            return np.transpose(pred, (1,2,3,0))
         return pred
-
     else:
-        # 2D expects (H,W,C). If (C,H,W), swap.
         if pred.ndim == 3 and pred.shape[0] < min(pred.shape[1:]):
-            return np.transpose(pred, (1, 2, 0))
+            return np.transpose(pred, (1,2,0))
         return pred
-
 
 # ============================================================
 # 2D stitching helper
@@ -187,7 +207,8 @@ def stitch_predictions_3d(
     )
 
     patch_idx = 0
-    for pred in tqdm(generator, total=num_patches):
+    for output in tqdm(generator, total=num_patches):
+        pred , idx = output
         if patch_idx >= num_patches:
             break
 
@@ -208,21 +229,107 @@ def stitch_predictions_3d(
     stitched /= counts
     return stitched, counts
 
+# ============================================================
+# CPU Stitcher
+# ============================================================
+
+def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=False):
+    """Vectorized CPU stitcher"""
+    original_shape = dset._data.shape
+    Z,H,W,C = original_shape[1:5]
+
+    stitched = np.zeros(original_shape, dtype=np.float32)
+    counts = np.zeros_like(stitched)
+
+    idx_manager = dset.idx_manager
+    inner_fractions = _parse_inner_fractions(inner_fraction, 3)
+    start_inners, _, inner_tile_sizes = _compute_inner_crop_params(idx_manager.patch_spatial_dims, inner_fractions)
+
+    for batch_pred, batch_indices in tqdm(generator):
+        B = batch_pred.shape[0]
+        for i in range(B):
+            pred = _ensure_channel_last(batch_pred[i], is_3d=True)
+            loc = idx_manager.get_patch_location_from_dataset_idx(int(batch_indices[i]))
+            _, z0, y0, x0 = loc
+
+            zs = z0 + start_inners[0]
+            hs = y0 + start_inners[1]
+            ws = x0 + start_inners[2]
+
+            ze = min(zs + inner_tile_sizes[0], Z)
+            he = min(hs + inner_tile_sizes[1], H)
+            we = min(ws + inner_tile_sizes[2], W)
+
+            zz = min(pred.shape[0], ze - zs)
+            hh = min(pred.shape[1], he - hs)
+            ww = min(pred.shape[2], we - ws)
+
+            if zz <=0 or hh <=0 or ww <=0:
+                continue
+
+            stitched[loc[0], zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += pred[:zz, :hh, :ww, :]
+            counts[loc[0], zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += 1
+
+    counts[counts==0] = 1
+    return stitched / counts, counts
+
 
 # ============================================================
-# OPTIONAL DISPATCHER (keeps your old interface)
+# GPU Stitcher
 # ============================================================
 
-def stitch_predictions_windowed(
-    generator,
-    dset,
-    inner_fraction=0.5,
-    debug=False
-):
+def stitch_predictions_3d_gpu(generator, dset, inner_fraction=0.5, debug=False, device="cuda"):
+    """GPU stitcher using torch tensors"""
+    idx_manager = dset.idx_manager
+    Z,H,W,C = dset._data.shape[1:5]
+
+    stitched = torch.zeros(dset._data.shape, device=device)
+    counts = torch.zeros_like(stitched)
+
+    inner_fractions = _parse_inner_fractions(inner_fraction, 3)
+    start_inners, _, inner_tile_sizes = _compute_inner_crop_params(idx_manager.patch_spatial_dims, inner_fractions)
+
+    for batch_pred, batch_indices in tqdm(generator):
+        B = batch_pred.shape[0]
+        for i in range(B):
+            pred = batch_pred[i].to(device)
+            loc = idx_manager.get_patch_location_from_dataset_idx(int(batch_indices[i]))
+            _, z0, y0, x0 = loc
+
+            zs = z0 + start_inners[0]
+            hs = y0 + start_inners[1]
+            ws = x0 + start_inners[2]
+
+            ze = min(zs + inner_tile_sizes[0], Z)
+            he = min(hs + inner_tile_sizes[1], H)
+            we = min(ws + inner_tile_sizes[2], W)
+
+            zz = min(pred.shape[0], ze - zs)
+            hh = min(pred.shape[1], he - hs)
+            ww = min(pred.shape[2], we - ws)
+
+            if zz <=0 or hh <=0 or ww <=0:
+                continue
+
+            stitched[:, zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += pred[:zz,:hh,:ww,:]
+            counts[:, zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += 1
+
+    counts[counts==0] = 1
+    return stitched / counts, counts
+
+
+# ============================================================
+# Main Dispatcher
+# ============================================================
+
+def stitch_predictions_windowed(generator, dset, inner_fraction=0.5, debug=False,
+                                use_gpu=False, vectorized=False):
     dims = len(dset.idx_manager.patch_spatial_dims)
-    if dims == 2:
-        return stitch_predictions_2d(generator, dset, inner_fraction, debug)
-    elif dims == 3:
-        return stitch_predictions_3d(generator, dset, inner_fraction, debug)
+    if dims != 3:
+        raise ValueError("Only 3D stitching implemented in this version")
+    if use_gpu:
+        return stitch_predictions_3d_gpu(generator, dset, inner_fraction, debug)
+    elif vectorized:
+        return stitch_predictions_3d_vectorized(generator, dset, inner_fraction, debug)
     else:
-        raise ValueError(f"Unsupported spatial dims={dims}")
+        raise ValueError("Non-vectorized CPU stitching not implemented")

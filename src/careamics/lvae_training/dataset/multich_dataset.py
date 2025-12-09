@@ -54,6 +54,7 @@ class MultiChDloader:
             self._datausage_fraction = data_config.validation_datausage_fraction
         else:
             self._datausage_fraction = 1.0
+        self._is_train = (data_config.datasplit_type == DataSplitType.Train)
 
         self.load_data(
             data_config,
@@ -85,8 +86,6 @@ class MultiChDloader:
             assert (
                 self._overlapping_padding_kwargs is not None
             ), "When not trimming boudnary, padding is needed."
-
-        self._is_train = data_config.datasplit_type == DataSplitType.Train
 
         # input = alpha * ch1 + (1-alpha)*ch2.
         # alpha is sampled randomly between these two extremes
@@ -196,15 +195,46 @@ class MultiChDloader:
         test_fraction=None,
         allow_generation=None,
     ):
+        
+        #!Adding padding here :
+        # if data_config.datasplit_type != DataSplitType.Test:
+        #     self._data = None
+        # else:
         self._data = load_data_fn(
-            data_config,
-            self._fpath,
-            datasplit_type,
-            val_fraction=val_fraction,
-            test_fraction=test_fraction,
-            allow_generation=allow_generation,
+        data_config,
+        self._fpath,
+        datasplit_type,
+        val_fraction=val_fraction,
+        test_fraction=test_fraction,
+        allow_generation=allow_generation,
         )
+    
+        self._data = self.reflect_pad(self._data)
         self._loaded_data_preprocessing(data_config)
+
+    def reflect_pad(self, arr):
+        """
+        Pad the array on depth, height, width axes by the computed minimal padding
+        to guarantee ≥64 coverage when stitching inner 50% of each patch.
+        
+        Input shape: NZYXC
+        """
+        # Minimal per-axis padding per side
+        pad_values = {
+            1: 5,   # Z / depth
+            2: 48,  # Y / height
+            3: 48,   # X / width
+        }
+
+        pad_width = []
+        for i in range(arr.ndim):
+            if i in pad_values:
+                p = pad_values[i]
+                pad_width.append((p, p))
+            else:
+                pad_width.append((0, 0))
+        print(f"[{self.__class__.__name__}] Padded Data Size {self._data.shape} with {pad_values.values} per side on D, H, W axes.")
+        return np.pad(arr, pad_width, mode="reflect")
 
     def _loaded_data_preprocessing(self, data_config):
         old_shape = self._data.shape
@@ -416,7 +446,14 @@ class MultiChDloader:
             patch_shape = (1, patch_size, patch_size, numC)
 
         return patch_shape, grid_shape
-
+    
+    def get_stride(self,grid_size: Union[int, Tuple[int, int, int]]):
+        if isinstance(grid_size, int):            # 2D
+            v = max(1, grid_size // 8)
+            return (v, v)
+        # 3D: (Z, H, W)
+        return tuple(max(1, g // 8) for g in grid_size)
+            
     def set_img_sz(self, image_size, grid_size: Union[int, Tuple[int, int, int]]):
         """
         If one wants to change the image size on the go, then this can be used.
@@ -432,13 +469,9 @@ class MultiChDloader:
         patch_shape, grid_shape = self.get_idx_manager_shapes(
             self._img_sz, self._grid_sz
         )
-
+        
         if self.sliding_window_flag:
-            if isinstance(self._grid_sz, int):  # 2D case
-                stride_val = grid_size // 8
-                stride_spatial = (stride_val, stride_val)
-            else:  # 3D case
-                stride_spatial = tuple(grid_size[i] // 8 for i in range(len(grid_size)))
+            stride_spatial = self.get_stride(grid_size)
 
             print("From inside set_img_sz of multich_dataset.py:")
             print(f"[{self.__class__.__name__}] Data Size {self._data.shape}")
