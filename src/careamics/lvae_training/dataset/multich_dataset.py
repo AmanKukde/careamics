@@ -206,7 +206,10 @@ class MultiChDloader:
     
         # self._data = self.reflect_pad(self._data)
         # self._data.shape == (2,15,1608,1608,2)
-        self.explicit_pad_width = ((0,0), (9,8), (48,48), (48,48), (0,0))
+        if self.self.sliding_window_flag:
+            self.explicit_pad_width = ((0,0), (9,8), (48,48), (48,48), (0,0))
+        else:
+            self.explicit_pad_width = ((0,0), (0,0), (16,16), (16,16), (0,0))
         self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
         print("padded data !")
         self._loaded_data_preprocessing(data_config)
