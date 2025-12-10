@@ -1,8 +1,9 @@
 import numpy as np
 from typing import Iterator, Union, List, Tuple
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
 import tifffile as tf
+import torch
 
 # ============================================================
 # Helper Utilities
@@ -60,17 +61,24 @@ def compute_needed_patch_indices(
 
 
 
-def _ensure_channel_last(pred: np.ndarray, is_3d: bool):
+def _ensure_channel_last(pred, is_3d: bool):
     """Convert prediction to channel-last format"""
+    is_torch = isinstance(pred, torch.Tensor)
+    
     if is_3d:
         if pred.ndim == 4 and pred.shape[0] < min(pred.shape[1:]):
-            return np.transpose(pred, (1,2,3,0))
+            if is_torch:
+                return pred.permute(1, 2, 3, 0)
+            else:
+                return np.transpose(pred, (1, 2, 3, 0))
         return pred
     else:
         if pred.ndim == 3 and pred.shape[0] < min(pred.shape[1:]):
-            return np.transpose(pred, (1,2,0))
+            if is_torch:
+                return pred.permute(1, 2, 0)
+            else:
+                return np.transpose(pred, (1, 2, 0))
         return pred
-
 # ============================================================
 # 2D stitching helper
 # ============================================================
@@ -245,7 +253,7 @@ def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=
     inner_fractions = _parse_inner_fractions(inner_fraction, 3)
     start_inners, _, inner_tile_sizes = _compute_inner_crop_params(idx_manager.patch_spatial_dims, inner_fractions)
 
-    for batch_pred, batch_indices in tqdm(generator):
+    for batch_pred, batch_indices in tqdm(generator,dynamic_ncols=True):
         B = batch_pred.shape[0]
         for i in range(B):
             pred = _ensure_channel_last(batch_pred[i], is_3d=True)
@@ -274,62 +282,102 @@ def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=
     return stitched / counts, counts
 
 
-# ============================================================
-# GPU Stitcher
-# ============================================================
 
-def stitch_predictions_3d_gpu(generator, dset, inner_fraction=0.5, debug=False, device="cuda"):
-    """GPU stitcher using torch tensors"""
+def _compute_inner_crop_params(patch_spatial_dims, inner_fractions, debug=False):
+    start, end, size = [], [], []
+    for i, (full, frac) in enumerate(zip(patch_spatial_dims, inner_fractions)):
+        inner_size = int(full * frac)
+        s = (full - inner_size) // 2
+        e = s + inner_size
+        start.append(s)
+        end.append(e)
+        size.append(inner_size)
+        if debug:
+            print(f"[DEBUG] Dim {i}: full={full}, frac={frac}, inner_size={inner_size}, start={s}, end={e}")
+    return start, end, size
+
+# ============================================================
+# CPU Stitcher (Vectorized) with Debug
+# ============================================================
+def stitch_predictions_3d_gpu(
+    generator, dset, inner_fraction=0.5, debug=False, device="cuda"
+):
+    """Optimized GPU stitcher using scatter operations instead of indexing."""
     idx_manager = dset.idx_manager
-    Z,H,W,C = dset._data.shape[1:5]
-
-    stitched = torch.zeros(dset._data.shape, device=device)
+    original_shape = dset._data.shape
+    Z, H, W, C = original_shape[1:5]
+    
+    stitched = torch.zeros(original_shape, device=device, dtype=torch.float32)
     counts = torch.zeros_like(stitched)
-
+    
+    # Parse fractions & compute crop params
     inner_fractions = _parse_inner_fractions(inner_fraction, 3)
-    start_inners, _, inner_tile_sizes = _compute_inner_crop_params(idx_manager.patch_spatial_dims, inner_fractions)
-
-    for batch_pred, batch_indices in tqdm(generator):
+    start_inners, end_inners, inner_tile_sizes = _compute_inner_crop_params(
+        idx_manager.patch_spatial_dims, inner_fractions, debug=debug
+    )
+    
+    cz0, cy0, cx0 = start_inners
+    zz, hh, ww = inner_tile_sizes
+    
+    # Pre-compute ALL patch locations
+    num_patches = len(dset)
+    all_locs = torch.zeros((num_patches, 4), dtype=torch.long, device=device)
+    for i in range(num_patches):
+        loc = idx_manager.get_patch_location_from_dataset_idx(i)
+        all_locs[i] = torch.tensor(loc, device=device)
+    
+    if debug:
+        print(f"[DEBUG] Pre-computed {num_patches} patch locations")
+    
+    for batch_pred, batch_indices in generator:
         B = batch_pred.shape[0]
+        batch_pred = _ensure_channel_last(batch_pred, is_3d=True).to(device).float()
+        
+        # Get locations for this batch
+        locs = all_locs[batch_indices.long()]  # [B, 4]
+        
+        # Crop all patches at once
+        crops = batch_pred[:, cz0:cz0+zz, cy0:cy0+hh, cx0:cx0+ww, :]  # [B, zz, hh, ww, C]
+        
+        # Process batch in parallel
         for i in range(B):
-            pred = batch_pred[i].to(device)
-            loc = idx_manager.get_patch_location_from_dataset_idx(int(batch_indices[i]))
-            _, z0, y0, x0 = loc
-
-            zs = z0 + start_inners[0]
-            hs = y0 + start_inners[1]
-            ws = x0 + start_inners[2]
-
-            ze = min(zs + inner_tile_sizes[0], Z)
-            he = min(hs + inner_tile_sizes[1], H)
-            we = min(ws + inner_tile_sizes[2], W)
-
-            zz = min(pred.shape[0], ze - zs)
-            hh = min(pred.shape[1], he - hs)
-            ww = min(pred.shape[2], we - ws)
-
-            if zz <=0 or hh <=0 or ww <=0:
-                continue
-
-            stitched[:, zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += pred[:zz,:hh,:ww,:]
-            counts[:, zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += 1
-
-    counts[counts==0] = 1
-    return stitched / counts, counts
-
+            b0, z0, y0, x0 = locs[i].tolist()
+            zs, hs, ws = z0 + cz0, y0 + cy0, x0 + cx0
+            ze, he, we = min(zs + zz, Z), min(hs + hh, H), min(ws + ww, W)
+            
+            actual_zz = ze - zs
+            actual_hh = he - hs
+            actual_ww = we - ws
+            
+            if actual_zz > 0 and actual_hh > 0 and actual_ww > 0:
+                crop = crops[i, :actual_zz, :actual_hh, :actual_ww, :]
+                
+                # Use add_ (in-place) instead of += to avoid copy
+                stitched[b0, zs:ze, hs:he, ws:we, :].add_(crop)
+                counts[b0, zs:ze, hs:he, ws:we, :].add_(1)
+    
+    # Avoid divide-by-zero
+    counts.clamp_(min=1)
+    stitched.div_(counts)
+    
+    if debug:
+        print("[DEBUG] Final GPU stitching complete")
+    
+    return stitched, counts
 
 # ============================================================
 # Main Dispatcher
 # ============================================================
 
 def stitch_predictions_windowed(generator, dset, inner_fraction=0.5, debug=False,
-                                use_gpu=False, vectorized=False):
+                                gpu=False, vectorized=False):
     dims = len(dset.idx_manager.patch_spatial_dims)
     if dims != 3:
         raise ValueError("Only 3D stitching implemented in this version")
-    if use_gpu:
+    if gpu:
         return stitch_predictions_3d_gpu(generator, dset, inner_fraction, debug)
     elif vectorized:
         return stitch_predictions_3d_vectorized(generator, dset, inner_fraction, debug)
     else:
         raise ValueError("Non-vectorized CPU stitching not implemented")
+    

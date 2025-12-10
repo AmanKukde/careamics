@@ -195,45 +195,49 @@ class MultiChDloader:
         test_fraction=None,
         allow_generation=None,
     ):
-        
-        #!Adding padding here :
-        # if data_config.datasplit_type != DataSplitType.Test:
-        #     self._data = None
-        # else:
         self._data = load_data_fn(
-        data_config,
-        self._fpath,
-        datasplit_type,
-        val_fraction=val_fraction,
-        test_fraction=test_fraction,
-        allow_generation=allow_generation,
+            data_config,
+            self._fpath,
+            datasplit_type,
+            val_fraction=val_fraction,
+            test_fraction=test_fraction,
+            allow_generation=allow_generation,
         )
     
-        self._data = self.reflect_pad(self._data)
+        # self._data = self.reflect_pad(self._data)
+        # self._data.shape == (2,15,1608,1608,2)
+        self.explicit_pad_width = ((0,0), (9,8), (48,48), (48,48), (0,0))
+        self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
+        print("padded data !")
         self._loaded_data_preprocessing(data_config)
 
-    def reflect_pad(self, arr):
+    def reflect_pad(self, arr, pad_width=None):
         """
-        Pad the array on depth, height, width axes by the computed minimal padding
-        to guarantee ≥64 coverage when stitching inner 50% of each patch.
+        Pad the array on depth, height, width axes by either:
+        - provided pad_width (explicit), or
+        - computed minimal padding (default)
         
-        Input shape: NZYXC
+        Input shape: N Z Y X C
         """
-        # Minimal per-axis padding per side
-        pad_values = {
-            1: 5,   # Z / depth
-            2: 48,  # Y / height
-            3: 48,   # X / width
-        }
 
-        pad_width = []
-        for i in range(arr.ndim):
-            if i in pad_values:
-                p = pad_values[i]
-                pad_width.append((p, p))
-            else:
-                pad_width.append((0, 0))
-        print(f"[{self.__class__.__name__}] Padded Data Size {self._data.shape} with {pad_values.values} per side on D, H, W axes.")
+        if pad_width is None:
+            # Minimal per-axis padding per side
+            pad_values = {
+                1: 5,    # Z / depth
+                2: 48,   # Y / height
+                3: 48,   # X / width
+            }
+
+            pad_width = []
+            for i in range(arr.ndim):
+                if i in pad_values:
+                    p = pad_values[i]
+                    pad_width.append((p, p))
+                else:
+                    pad_width.append((0, 0))
+            pad_width = tuple(pad_width)
+
+        print(f"[{self.__class__.__name__}] pad_width={pad_width}")
         return np.pad(arr, pad_width, mode="reflect")
 
     def _loaded_data_preprocessing(self, data_config):
@@ -452,7 +456,8 @@ class MultiChDloader:
             v = max(1, grid_size // 8)
             return (v, v)
         # 3D: (Z, H, W)
-        return tuple(max(1, g // 8) for g in grid_size)
+        return (4,8,8) #!@AMAN HARDCODED: Should pass in config
+        # return tuple(max(1, g // 4) for g in grid_size)
             
     def set_img_sz(self, image_size, grid_size: Union[int, Tuple[int, int, int]]):
         """
@@ -463,6 +468,7 @@ class MultiChDloader:
         """
         # hacky way to deal with image shape from new conf
         self._img_sz = image_size[-1]  # TODO revisit!
+        self._depth3D = image_size[0]
         self._grid_sz = grid_size
         shape = self._data.shape
 
@@ -587,7 +593,7 @@ class MultiChDloader:
             },
         )
 
-    def _crop_img(self, img: np.ndarray, patch_start_loc: Tuple):
+    def _crop_img(self, img: np.ndarray, patch_start_loc: tuple):
         if self._tiling_mode in [TilingMode.TrimBoundary, TilingMode.ShiftBoundary]:
             # In training, this is used.
             # NOTE: It is my opinion that if I just use self._crop_img_with_padding, it will work perfectly fine.
@@ -668,7 +674,7 @@ class MultiChDloader:
         return new_img
 
     def _crop_flip_img(
-        self, img: np.ndarray, patch_start_loc: Tuple, h_flip: bool, w_flip: bool
+        self, img: np.ndarray, patch_start_loc: tuple, h_flip: bool, w_flip: bool
     ):
         new_img = self._crop_img(img, patch_start_loc)
         if h_flip:
@@ -679,8 +685,8 @@ class MultiChDloader:
         return new_img.astype(np.float32)
 
     def _load_img(
-        self, index: Union[int, Tuple[int, int]]
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        self, index: Union[int, tuple[int, int]]
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Returns the channels and also the respective noise channels.
         """
@@ -877,7 +883,7 @@ class MultiChDloader:
             w_start = 0
         return h_start, w_start
 
-    def _get_img(self, index: Union[int, Tuple[int, int]]):
+    def _get_img(self, index: Union[int, tuple[int, int]]):
         """
         Loads an image.
         Crops the image such that cropped image has content.
@@ -1127,8 +1133,8 @@ class MultiChDloader:
         return img_tuples, noise_tuples
 
     def __getitem__(
-        self, index: Union[int, Tuple[int, int]]
-    ) -> Tuple[np.ndarray, np.ndarray]:
+        self, index: Union[int, tuple[int, int]]
+    ) -> tuple[np.ndarray, np.ndarray]:
         # Vera: input can be both real microscopic image and two separate channels that are summed in the code
 
         if self._train_index_switcher is not None:
