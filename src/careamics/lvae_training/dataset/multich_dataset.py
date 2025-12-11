@@ -11,7 +11,7 @@ from .utils.index_manager import GridIndexManager
 from .utils.windowed_tiling_manager import WindowedTilingGridIndexManager
 from .utils.index_switcher import IndexSwitcher
 from .config import DatasetConfig
-from .types import DataSplitType, TilingMode
+from .types import DataSplitType, TilingMode,DataType
 
 
 class MultiChDloader:
@@ -206,12 +206,16 @@ class MultiChDloader:
     
         # self._data = self.reflect_pad(self._data)
         # self._data.shape == (2,15,1608,1608,2)
-        if self.self.sliding_window_flag:
-            self.explicit_pad_width = ((0,0), (9,8), (48,48), (48,48), (0,0))
-        else:
-            self.explicit_pad_width = ((0,0), (0,0), (16,16), (16,16), (0,0))
-        self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
-        print("padded data !")
+        if data_config.data_type == DataType.HTH24Data:
+            if self.sliding_window_flag:
+                self.explicit_pad_width = ((0,0), (9,8), (48,48), (48,48), (0,0))
+            else:
+                if "mode" == "IT":
+                    self.explicit_pad_width = ((0,0), (0,0), (16,16), (16,16), (0,0))
+                else:
+                    self.explicit_pad_width = ((0,0), (0,0), (32,32), (32,32), (0,0))
+            self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
+            print("padded data !")
         self._loaded_data_preprocessing(data_config)
 
     def reflect_pad(self, arr, pad_width=None):
