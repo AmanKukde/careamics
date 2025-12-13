@@ -1,4 +1,3 @@
-
 import time
 import numpy as np
 from typing import Iterator, Union, List, Tuple
@@ -11,28 +10,6 @@ from pathlib import Path
 # ============================================================
 # Helper Utilities
 # ============================================================
-
-def _parse_inner_fractions(inner_fraction, num_dims: int):
-    if isinstance(inner_fraction, (int, float)):
-        return [inner_fraction] * num_dims
-    if isinstance(inner_fraction, (list, tuple)):
-        if len(inner_fraction) != num_dims:
-            raise ValueError(f"Expected {num_dims} inner fractions, got {len(inner_fraction)}")
-        return list(inner_fraction)
-    raise TypeError("inner_fraction must be float or list")
-
-
-def _compute_inner_crop_params(patch_spatial_dims, inner_fractions):
-    start, end, size = [], [], []
-    for full, frac in zip(patch_spatial_dims, inner_fractions):
-        inner_size = int(full * frac)
-        s = (full - inner_size) // 2
-        e = s + inner_size
-        start.append(s)
-        end.append(e)
-        size.append(inner_size)
-    return start, end, size
-
 
 def compute_needed_patch_indices(
     dataset_shape,   # (Z, Y, X)
@@ -63,7 +40,6 @@ def compute_needed_patch_indices(
     return patch_indices.astype(int)
 
 
-
 def _ensure_channel_last(pred, is_3d: bool):
     """Convert prediction to channel-last format"""
     is_torch = isinstance(pred, torch.Tensor)
@@ -82,6 +58,8 @@ def _ensure_channel_last(pred, is_3d: bool):
             else:
                 return np.transpose(pred, (1, 2, 0))
         return pred
+
+
 # ============================================================
 # 2D stitching helper
 # ============================================================
@@ -141,7 +119,7 @@ def _apply_crop_and_stitch_3d(
     pred_crop = pred[:zz, :hh, :ww, :]
     stitched[loc[0], zs:ze, hs:he, ws:we, :] += pred_crop
     counts[loc[0], zs:ze, hs:he, ws:we, :] += 1
-    
+
 
 # ============================================================
 # MAIN 2D FUNCTION
@@ -219,7 +197,7 @@ def stitch_predictions_3d(
 
     patch_idx = 0
     for output in tqdm(generator, total=num_patches):
-        pred , idx = output
+        pred, idx = output
         if patch_idx >= num_patches:
             break
 
@@ -233,21 +211,22 @@ def stitch_predictions_3d(
         )
 
         patch_idx += 1
-        if debug and patch_idx%1000 == 0:
-            intermediate =  stitched/np.maximum(1,counts)
-            tf.imwrite("my_image.tiff",intermediate.transpose(0,4,1,2,3))
+        if debug and patch_idx % 1000 == 0:
+            intermediate = stitched / np.maximum(1, counts)
+            tf.imwrite("my_image.tiff", intermediate.transpose(0, 4, 1, 2, 3))
     counts[counts == 0] = 1
     stitched /= counts
     return stitched, counts
 
+
 # ============================================================
-# CPU Stitcher
+# CPU Stitcher (Vectorized)
 # ============================================================
 
 def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=False):
     """Vectorized CPU stitcher"""
     original_shape = dset._data.shape
-    Z,H,W,C = original_shape[1:5]
+    Z, H, W, C = original_shape[1:5]
 
     stitched = np.zeros(original_shape, dtype=np.float32)
     counts = np.zeros_like(stitched)
@@ -256,7 +235,7 @@ def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=
     inner_fractions = _parse_inner_fractions(inner_fraction, 3)
     start_inners, _, inner_tile_sizes = _compute_inner_crop_params(idx_manager.patch_spatial_dims, inner_fractions)
 
-    for batch_pred, batch_indices in tqdm(generator,dynamic_ncols=True):
+    for batch_pred, batch_indices in tqdm(generator, dynamic_ncols=True):
         B = batch_pred.shape[0]
         for i in range(B):
             pred = _ensure_channel_last(batch_pred[i], is_3d=True)
@@ -275,33 +254,20 @@ def stitch_predictions_3d_vectorized(generator, dset, inner_fraction=0.5, debug=
             hh = min(pred.shape[1], he - hs)
             ww = min(pred.shape[2], we - ws)
 
-            if zz <=0 or hh <=0 or ww <=0:
+            if zz <= 0 or hh <= 0 or ww <= 0:
                 continue
 
             stitched[loc[0], zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += pred[:zz, :hh, :ww, :]
             counts[loc[0], zs:zs+zz, hs:hs+hh, ws:ws+ww, :] += 1
 
-    counts[counts==0] = 1
+    counts[counts == 0] = 1
     return stitched / counts, counts
 
 
-
-def _compute_inner_crop_params(patch_spatial_dims, inner_fractions, debug=False):
-    start, end, size = [], [], []
-    for i, (full, frac) in enumerate(zip(patch_spatial_dims, inner_fractions)):
-        inner_size = int(full * frac)
-        s = (full - inner_size) // 2
-        e = s + inner_size
-        start.append(s)
-        end.append(e)
-        size.append(inner_size)
-        if debug:
-            print(f"[DEBUG] Dim {i}: full={full}, frac={frac}, inner_size={inner_size}, start={s}, end={e}")
-    return start, end, size
-
 # ============================================================
-# CPU Stitcher (Vectorized) with Debug
+# GPU Stitcher (Basic)
 # ============================================================
+
 def stitch_predictions_3d_gpu(
     generator, dset, inner_fraction=0.5, debug=False, device="cuda"
 ):
@@ -324,7 +290,6 @@ def stitch_predictions_3d_gpu(
     
     # Pre-compute ALL patch locations
     num_patches = len(dset)
-    
 
     print("Computing all locations now...")
     t1 = time.time()
@@ -344,7 +309,6 @@ def stitch_predictions_3d_gpu(
         batch_pred = _ensure_channel_last(batch_pred, is_3d=True).to(device).float()
         
         # Get locations for this batch
-
         locs = all_locs[batch_indices.long()]  # [B, 4]
         # Crop all patches at once
         crops = batch_pred[:, cz0:cz0+zz, cy0:cy0+hh, cx0:cx0+ww, :]  # [B, zz, hh, ww, C]
@@ -375,9 +339,11 @@ def stitch_predictions_3d_gpu(
     
     return stitched, counts
 
+
 # ============================================================
-# Main Dispatcher
+# Helper Functions (Keep latter versions)
 # ============================================================
+
 def _parse_inner_fractions(inner_fraction, ndim):
     """Parse inner_fraction into a tuple of fractions per dimension."""
     if isinstance(inner_fraction, (list, tuple)):
@@ -409,199 +375,65 @@ def _compute_inner_crop_params(patch_dims, inner_fractions, debug=False):
     return start_inners, end_inners, inner_sizes
 
 
-def stitch_predictions_gpu(
-    predictions: torch.Tensor,
-    dset,
-    inner_fraction: float = 0.5,
-    device: str = "cuda",
-    debug: bool = False,
-) -> torch.Tensor:
-    """
-    GPU-based stitcher that maintains compatibility with existing stitching logic.
+def precompute_all_locations_fast(mng, num_tiles, device):
+    """Precompute all tile locations at once - FAST VERSION."""
+    # Get all locations as numpy first (faster on CPU)
+    all_locs_np = np.zeros((num_tiles, len(mng.data_shape)), dtype=np.int64)
+    for i in range(num_tiles):
+        loc = mng.get_location_from_dataset_idx(i)
+        all_locs_np[i] = loc
     
-    Parameters
-    ----------
-    predictions : torch.Tensor
-        Predictions tensor of shape [N, C, *spatial_dims] where N is number of tiles.
-    dset : Dataset
-        Dataset with idx_manager containing grid information.
-    inner_fraction : float
-        Fraction of inner tile to use (0.5 = use middle 50% of each tile).
-    device : str
-        Device to use for stitching.
-    debug : bool
-        Enable debug output.
-        
-    Returns
-    -------
-    torch.Tensor
-        Stitched predictions matching the original data shape.
-    """
-    predictions = predictions.to(device)
-    mng = dset.idx_manager
+    # Single transfer to GPU
+    all_locs = torch.from_numpy(all_locs_np).to(device)
     
-    # Get data shape and determine dimensionality
-    data_shape = list(dset.get_data_shape())
-    num_channels = max(data_shape[-1], predictions.shape[1])
-    data_shape[-1] = num_channels
+    # Precompute constants as tensors (once)
+    grid_shape = torch.tensor(mng.grid_shape, dtype=torch.long, device=device)
+    patch_offset = torch.tensor(mng.patch_offset(), dtype=torch.long, device=device)
+    patch_shape = torch.tensor(mng.patch_shape, dtype=torch.long, device=device)
+    data_shape = torch.tensor(mng.data_shape, dtype=torch.long, device=device)
     
-    # Determine spatial dimensions (exclude channel)
-    spatial_ndim = len(data_shape) - 1
+    # Vectorized computation for ALL tiles at once
+    gs = all_locs  # [N, ndim]
+    ge = gs + grid_shape.unsqueeze(0)  # Broadcasting
+    ps = gs - patch_offset.unsqueeze(0)
+    pe = ps + patch_shape.unsqueeze(0)
     
-    if debug:
-        print(f"Data shape: {data_shape}")
-        print(f"Predictions shape: {predictions.shape}")
-        print(f"Spatial dimensions: {spatial_ndim}")
+    # Clipping (vectorized)
+    vgs = torch.maximum(gs, torch.zeros(1, dtype=torch.long, device=device))
+    vge = torch.minimum(ge, data_shape.unsqueeze(0))
     
-    # Initialize output tensors
-    output = torch.zeros(data_shape, device=device, dtype=predictions.dtype)
-    counts = torch.zeros(data_shape, device=device, dtype=torch.float32)
+    # ShiftBoundary mode (vectorized per dimension)
+    from eval_utils import TilingMode
+    if mng.tiling_mode == TilingMode.ShiftBoundary:
+        for dim in range(ps.shape[1]):
+            boundary_start_mask = ps[:, dim] == 0
+            boundary_end_mask = pe[:, dim] == data_shape[dim]
+            vgs[boundary_start_mask, dim] = 0
+            vge[boundary_end_mask, dim] = data_shape[dim]
     
-    # Compute inner crop parameters
-    patch_spatial_dims = list(predictions.shape[2:])  # Exclude batch and channel
-    inner_fractions = _parse_inner_fractions(inner_fraction, len(patch_spatial_dims))
-    start_inners, end_inners, inner_sizes = _compute_inner_crop_params(
-        patch_spatial_dims, inner_fractions, debug=debug
-    )
+    # Relative positions
+    rs = vgs - ps
+    re = rs + (vge - vgs)
     
-    # Process each tile
-    for dset_idx in tqdm(range(predictions.shape[0]), desc="GPU Stitching", disable=not debug):
-        # Get grid location for this tile
-        gs = torch.tensor(mng.get_location_from_dataset_idx(dset_idx), 
-                         dtype=torch.long, device=device)
-        ge = gs + torch.tensor(mng.grid_shape, dtype=torch.long, device=device)
-        
-        # Patch start and end
-        ps = gs - torch.tensor(mng.patch_offset(), dtype=torch.long, device=device)
-        pe = ps + torch.tensor(mng.patch_shape, dtype=torch.long, device=device)
-        
-        # Valid grid start and end (clipped to data bounds)
-        vgs = torch.maximum(gs, torch.zeros_like(gs))
-        vge = torch.minimum(ge, torch.tensor(mng.data_shape, dtype=torch.long, device=device))
-        
-        # Handle boundary shift mode
-        if mng.tiling_mode == TilingMode.ShiftBoundary:
-            for dim in range(len(vgs)):
-                if ps[dim] == 0:
-                    vgs[dim] = 0
-                if pe[dim] == mng.data_shape[dim]:
-                    vge[dim] = mng.data_shape[dim]
-        
-        # Relative start and end in prediction tile
-        rs = vgs - ps
-        re = rs + (vge - vgs)
-        
-        # Apply inner crop offset
-        crop_offset = torch.tensor(start_inners, dtype=torch.long, device=device)
-        rs_cropped = rs + crop_offset
-        re_cropped = torch.minimum(
-            re,
-            torch.tensor([s + inner_sizes[i] for i, s in enumerate(start_inners)],
-                        dtype=torch.long, device=device)
-        )
-        
-        # Ensure we don't go out of bounds
-        re_cropped = torch.minimum(re_cropped, torch.tensor(patch_spatial_dims, dtype=torch.long, device=device))
-        
-        # Adjust output region accordingly
-        vgs_adj = vgs + (rs_cropped - rs)
-        vge_adj = vge - (re - re_cropped)
-        
-        # Process each channel
-        for ch_idx in range(predictions.shape[1]):
-            if spatial_ndim == 3:  # 4D output: [H, W, D, C]
-                h_s, h_e = vgs_adj[0].item(), vge_adj[0].item()
-                w_s, w_e = vgs_adj[1].item(), vge_adj[1].item()
-                d_s, d_e = vgs_adj[2].item(), vge_adj[2].item()
-                
-                rh_s, rh_e = rs_cropped[0].item(), re_cropped[0].item()
-                rw_s, rw_e = rs_cropped[1].item(), re_cropped[1].item()
-                rd_s, rd_e = rs_cropped[2].item(), re_cropped[2].item()
-                
-                if h_e > h_s and w_e > w_s and d_e > d_s:
-                    crop = predictions[dset_idx, ch_idx, rh_s:rh_e, rw_s:rw_e, rd_s:rd_e]
-                    output[h_s:h_e, w_s:w_e, d_s:d_e, ch_idx].add_(crop)
-                    counts[h_s:h_e, w_s:w_e, d_s:d_e, ch_idx].add_(1)
-                    
-            elif spatial_ndim == 4:  # 5D output: [T, H, W, D, C]
-                t_s, t_e = vgs_adj[0].item(), vge_adj[0].item()
-                h_s, h_e = vgs_adj[1].item(), vge_adj[1].item()
-                w_s, w_e = vgs_adj[2].item(), vge_adj[2].item()
-                d_s, d_e = vgs_adj[3].item(), vge_adj[3].item()
-                
-                rt_s, rt_e = rs_cropped[0].item(), re_cropped[0].item()
-                rh_s, rh_e = rs_cropped[1].item(), re_cropped[1].item()
-                rw_s, rw_e = rs_cropped[2].item(), re_cropped[2].item()
-                rd_s, rd_e = rs_cropped[3].item(), re_cropped[3].item()
-                
-                assert t_e - t_s <= 1, "Only one frame per tile is supported"
-                
-                if t_e > t_s and h_e > h_s and w_e > w_s and d_e > d_s:
-                    crop = predictions[dset_idx, ch_idx, rt_s:rt_e, rh_s:rh_e, rw_s:rw_e, rd_s:rd_e]
-                    output[t_s, h_s:h_e, w_s:w_e, d_s:d_e, ch_idx].add_(crop)
-                    counts[t_s, h_s:h_e, w_s:w_e, d_s:d_e, ch_idx].add_(1)
-            else:
-                raise ValueError(f"Unsupported spatial dimensions: {spatial_ndim}")
-    
-    # Average by count, avoiding division by zero
-    counts.clamp_(min=1)
-    output.div_(counts)
-    
-    if debug:
-        print(f"[DEBUG] GPU stitching complete. Output shape: {output.shape}")
-        print(f"[DEBUG] Overlap counts - min: {counts.min()}, max: {counts.max()}, mean: {counts.mean()}")
-    
-    return output
+    return vgs, vge, rs, re, gs, ps, pe
 
-
-def stitch_predictions_new(predictions, dset):
-    """
-    Original CPU-based stitcher for backward compatibility.
-    Args:
-        predictions: numpy array of predictions
-        dset: dataset with idx_manager
-    """
-    mng = dset.idx_manager
-    shape = list(dset.get_data_shape())
-    shape[-1] = max(shape[-1], predictions.shape[1])
-    output = np.zeros(shape, dtype=predictions.dtype)
-    
-    for dset_idx in range(predictions.shape[0]):
-        gs = np.array(mng.get_location_from_dataset_idx(dset_idx), dtype=int)
-        ge = gs + mng.grid_shape
-        ps = gs - mng.patch_offset()
-        pe = ps + mng.patch_shape
-        
-        vgs = np.array([max(0, x) for x in gs], dtype=int)
-        vge = np.array([min(x, y) for x, y in zip(ge, mng.data_shape)], dtype=int)
-        
-        if mng.tiling_mode == TilingMode.ShiftBoundary:
-            for dim in range(len(vgs)):
-                if ps[dim] == 0:
-                    vgs[dim] = 0
-                if pe[dim] == mng.data_shape[dim]:
-                    vge[dim] = mng.data_shape[dim]
-        
-        rs = vgs - ps
-        re = rs + (vge - vgs)
-        
-        for ch_idx in range(predictions.shape[1]):
-            if len(output.shape) == 4:
-                output[vgs[0]:vge[0], vgs[1]:vge[1], vgs[2]:vge[2], ch_idx] = (
-                    predictions[dset_idx][ch_idx, rs[1]:re[1], rs[2]:re[2]]
-                )
-            elif len(output.shape) == 5:
-                assert vge[0] - vgs[0] == 1, "Only one frame is supported"
-                output[vgs[0], vgs[1]:vge[1], vgs[2]:vge[2], vgs[3]:vge[3], ch_idx] = (
-                    predictions[dset_idx][ch_idx, rs[1]:re[1], rs[2]:re[2], rs[3]:re[3]]
-                )
-            else:
-                raise ValueError(f"Unsupported shape {output.shape}")
-    
-    return output
+# ============================================================
+# Main Dispatcher Function
+# ============================================================
 
 def stitch_predictions_windowed(generator, dset, inner_fraction=0.5, debug=False,
                                 gpu=False, vectorized=False):
+    """
+    Main entry point for stitching predictions with windowing.
+    
+    Args:
+        generator: Iterator yielding prediction batches
+        dset: Dataset with idx_manager
+        inner_fraction: Fraction of inner region to use (reduces overlap artifacts)
+        debug: Enable debug output
+        gpu: Use GPU-accelerated stitching
+        vectorized: Use vectorized CPU stitching
+    """
     dims = len(dset.idx_manager.patch_spatial_dims)
     if dims != 3:
         raise ValueError("Only 3D stitching implemented in this version")
@@ -611,4 +443,3 @@ def stitch_predictions_windowed(generator, dset, inner_fraction=0.5, debug=False
         return stitch_predictions_3d_vectorized(generator, dset, inner_fraction, debug)
     else:
         raise ValueError("Non-vectorized CPU stitching not implemented")
-    
