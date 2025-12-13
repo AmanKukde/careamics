@@ -23,7 +23,10 @@ from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
 from careamics.utils.metrics import scale_invariant_psnr
 import numpy as np
-from swt_stitching import *
+# At top of eval_utils.py, update imports:
+from swt_stitching import stitch_predictions_gpu_optimized  # Add this
+from time import time
+
 
 class TilingMode:
     """
@@ -608,6 +611,7 @@ def get_single_file_predictions(
 
     tile_samples = np.concatenate(tiles, axis=0)
     return stitch_predictions_new(tile_samples, dset)
+
 def get_single_file_mmse(
     model: VAEModule,
     dset: Dataset,
@@ -618,7 +622,7 @@ def get_single_file_mmse(
     num_workers: int = 4,
     use_gpu_stitching: bool = True,
     inner_fraction: float = 0.5,
-    profile: bool = False,
+    profile: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get patch-wise predictions from a model for a single file dataset."""
     device = get_device()
@@ -681,6 +685,7 @@ def get_single_file_mmse(
         
         # Stitching phase with detailed profiling
         t_stitch = time.time()
+
         stitched_predictions = stitch_predictions_gpu_optimized(
             tiles_tensor, dset, inner_fraction=inner_fraction, device=device, profile=profile
         )

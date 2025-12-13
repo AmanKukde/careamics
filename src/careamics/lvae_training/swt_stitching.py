@@ -375,8 +375,30 @@ def _compute_inner_crop_params(patch_dims, inner_fractions, debug=False):
     return start_inners, end_inners, inner_sizes
 
 
+# ============================================================
+# OPTIMIZED GPU STITCHING - ADD THIS SECTION
+# ============================================================
+
 def precompute_all_locations_fast(mng, num_tiles, device):
-    """Precompute all tile locations at once - FAST VERSION."""
+    """
+    Precompute all tile locations at once - FAST VERSION.
+    
+    This eliminates the need to call get_location_from_dataset_idx() in a loop,
+    which is very slow. Instead, we compute all locations on CPU with numpy
+    (fast) and transfer to GPU once.
+    
+    Args:
+        mng: Index manager from dataset
+        num_tiles: Total number of tiles
+        device: GPU device
+        
+    Returns:
+        Tuple of tensors: (vgs, vge, rs, re, gs, ps, pe)
+        All are [num_tiles, ndim] shaped tensors on GPU
+    """
+    import numpy as np
+    import torch
+    
     # Get all locations as numpy first (faster on CPU)
     all_locs_np = np.zeros((num_tiles, len(mng.data_shape)), dtype=np.int64)
     for i in range(num_tiles):
@@ -403,7 +425,16 @@ def precompute_all_locations_fast(mng, num_tiles, device):
     vge = torch.minimum(ge, data_shape.unsqueeze(0))
     
     # ShiftBoundary mode (vectorized per dimension)
-    from eval_utils import TilingMode
+    # Import TilingMode if needed
+    try:
+        from eval_utils import TilingMode
+    except ImportError:
+        # Fallback if TilingMode is defined elsewhere
+        class TilingMode:
+            TrimBoundary = 0
+            PadBoundary = 1
+            ShiftBoundary = 2
+    
     if mng.tiling_mode == TilingMode.ShiftBoundary:
         for dim in range(ps.shape[1]):
             boundary_start_mask = ps[:, dim] == 0
@@ -416,6 +447,217 @@ def precompute_all_locations_fast(mng, num_tiles, device):
     re = rs + (vge - vgs)
     
     return vgs, vge, rs, re, gs, ps, pe
+
+
+def stitch_predictions_gpu_optimized(
+    predictions: torch.Tensor,
+    dset,
+    inner_fraction: float = 0.5,
+    device: str = "cuda",
+    profile: bool = False,
+) -> torch.Tensor:
+    """
+    HEAVILY OPTIMIZED GPU stitcher - minimizes Python loops and CPU-GPU transfers.
+    
+    Preserves 100% of the original stitching logic but optimizes execution:
+    - Precomputes ALL locations once (vectorized)
+    - Keeps all data on GPU
+    - Minimizes .item() and .tolist() calls
+    - Batch processes channels
+    
+    Parameters
+    ----------
+    predictions : torch.Tensor
+        Predictions tensor of shape [N, C, *spatial_dims] where N is number of tiles.
+    dset : Dataset
+        Dataset with idx_manager containing grid information.
+    inner_fraction : float
+        Fraction of inner tile to use (0.5 = use middle 50% of each tile).
+    device : str
+        Device to use for stitching.
+    profile : bool
+        Enable detailed timing output.
+        
+    Returns
+    -------
+    torch.Tensor
+        Stitched predictions matching the original data shape.
+    """
+    import torch
+    import time
+    from tqdm import tqdm
+    
+    if profile:
+        torch.cuda.synchronize()
+        t_start = time.time()
+    
+    predictions = predictions.to(device)
+    mng = dset.idx_manager
+    
+    # Get dimensions
+    data_shape = list(dset.get_data_shape())
+    num_channels = max(data_shape[-1], predictions.shape[1])
+    data_shape[-1] = num_channels
+    spatial_ndim = len(data_shape) - 1
+    
+    if profile:
+        print(f"[STITCH] Data shape: {data_shape}, Spatial dims: {spatial_ndim}")
+        print(f"[STITCH] Predictions shape: {predictions.shape}")
+    
+    # Initialize output
+    if profile:
+        torch.cuda.synchronize()
+        t0 = time.time()
+    
+    output = torch.zeros(data_shape, device=device, dtype=predictions.dtype)
+    counts = torch.zeros(data_shape, device=device, dtype=torch.float32)
+    
+    if profile:
+        torch.cuda.synchronize()
+        print(f"[STITCH] Output allocation: {time.time() - t0:.3f}s")
+    
+    # Compute crop parameters
+    patch_spatial_dims = list(predictions.shape[2:])
+    inner_fractions = _parse_inner_fractions(inner_fraction, len(patch_spatial_dims))
+    start_inners, inner_sizes = _compute_inner_crop_params(patch_spatial_dims, inner_fractions)
+    
+    # Precompute ALL locations (FAST - vectorized)
+    if profile:
+        torch.cuda.synchronize()
+        t0 = time.time()
+    
+    vgs, vge, rs, re, gs, ps, pe = precompute_all_locations_fast(
+        mng, predictions.shape[0], device
+    )
+    
+    if profile:
+        torch.cuda.synchronize()
+        print(f"[STITCH] Location precomputation: {time.time() - t0:.3f}s")
+    
+    # Apply inner crop offset (vectorized for ALL tiles)
+    crop_offset = torch.tensor(start_inners, dtype=torch.long, device=device)
+    max_crop_end = torch.tensor(
+        [start_inners[i] + inner_sizes[i] for i in range(len(start_inners))],
+        dtype=torch.long, device=device
+    )
+    
+    rs_cropped = rs + crop_offset.unsqueeze(0)
+    re_cropped = torch.minimum(re, max_crop_end.unsqueeze(0))
+    re_cropped = torch.minimum(
+        re_cropped, 
+        torch.tensor(patch_spatial_dims, dtype=torch.long, device=device).unsqueeze(0)
+    )
+    
+    vgs_adj = vgs + (rs_cropped - rs)
+    vge_adj = vge - (re - re_cropped)
+    
+    # Main stitching loop - OPTIMIZED
+    if profile:
+        torch.cuda.synchronize()
+        t0 = time.time()
+    
+    num_tiles = predictions.shape[0]
+    
+    if spatial_ndim == 3:  # 4D output: [H, W, D, C]
+        # Convert to CPU numpy once for indexing (faster than repeated .item() calls)
+        vgs_adj_np = vgs_adj.cpu().numpy()
+        vge_adj_np = vge_adj.cpu().numpy()
+        rs_cropped_np = rs_cropped.cpu().numpy()
+        re_cropped_np = re_cropped.cpu().numpy()
+        
+        for dset_idx in range(num_tiles):
+            h_s, w_s, d_s = vgs_adj_np[dset_idx]
+            h_e, w_e, d_e = vge_adj_np[dset_idx]
+            
+            if h_e <= h_s or w_e <= w_s or d_e <= d_s:
+                continue
+            
+            rh_s, rw_s, rd_s = rs_cropped_np[dset_idx]
+            rh_e, rw_e, rd_e = re_cropped_np[dset_idx]
+            
+            # Extract crop for all channels at once
+            crop = predictions[dset_idx, :, rh_s:rh_e, rw_s:rw_e, rd_s:rd_e]
+            
+            # Permute to [H, W, D, C] format
+            crop = crop.permute(1, 2, 3, 0)
+            
+            # In-place addition (faster)
+            output[h_s:h_e, w_s:w_e, d_s:d_e, :].add_(crop)
+            counts[h_s:h_e, w_s:w_e, d_s:d_e, :].add_(1)
+    
+    elif spatial_ndim == 4:  # 5D output: [T, H, W, D, C]
+        vgs_adj_np = vgs_adj.cpu().numpy()
+        vge_adj_np = vge_adj.cpu().numpy()
+        rs_cropped_np = rs_cropped.cpu().numpy()
+        re_cropped_np = re_cropped.cpu().numpy()
+        
+        for dset_idx in range(num_tiles):
+            t_s, h_s, w_s, d_s = vgs_adj_np[dset_idx]
+            t_e, h_e, w_e, d_e = vge_adj_np[dset_idx]
+            
+            if t_e <= t_s or h_e <= h_s or w_e <= w_s or d_e <= d_s:
+                continue
+            
+            rt_s, rh_s, rw_s, rd_s = rs_cropped_np[dset_idx]
+            rt_e, rh_e, rw_e, rd_e = re_cropped_np[dset_idx]
+            
+            assert t_e - t_s == 1, "Only one frame per tile is supported"
+            
+            crop = predictions[dset_idx, :, rt_s:rt_e, rh_s:rh_e, rw_s:rw_e, rd_s:rd_e]
+            crop = crop.permute(1, 2, 3, 4, 0)  # [T, H, W, D, C]
+            
+            output[t_s, h_s:h_e, w_s:w_e, d_s:d_e, :].add_(crop[0])
+            counts[t_s, h_s:h_e, w_s:w_e, d_s:d_e, :].add_(1)
+    
+    else:
+        raise ValueError(f"Unsupported spatial dimensions: {spatial_ndim}")
+    
+    if profile:
+        torch.cuda.synchronize()
+        print(f"[STITCH] Main loop: {time.time() - t0:.3f}s ({num_tiles} tiles)")
+        print(f"[STITCH] Speed: {num_tiles/(time.time() - t0):.1f} tiles/sec")
+    
+    # Average by count
+    if profile:
+        torch.cuda.synchronize()
+        t0 = time.time()
+    
+    counts.clamp_(min=1)
+    output.div_(counts)
+    
+    if profile:
+        torch.cuda.synchronize()
+        print(f"[STITCH] Averaging: {time.time() - t0:.3f}s")
+        print(f"[STITCH] Total stitching: {time.time() - t_start:.3f}s")
+        print(f"[STITCH] Overlap stats - min: {counts.min():.1f}, max: {counts.max():.1f}, mean: {counts.mean():.1f}")
+    
+    return output
+
+
+def _compute_inner_crop_params(patch_dims, inner_fractions):
+    """
+    Compute crop parameters for inner region extraction.
+    
+    Args:
+        patch_dims: List of patch sizes per dimension [H, W] or [Z, H, W]
+        inner_fractions: List of fractions per dimension
+        
+    Returns:
+        Tuple of (start_inners, inner_sizes)
+    """
+    start_inners = []
+    inner_sizes = []
+    
+    for i in range(len(patch_dims)):
+        margin = int(patch_dims[i] * (1 - inner_fractions[i]) / 2)
+        start_inner = margin
+        end_inner = patch_dims[i] - margin
+        inner_size = end_inner - start_inner
+        
+        start_inners.append(start_inner)
+        inner_sizes.append(inner_size)
+    
+    return start_inners, inner_sizes
 
 # ============================================================
 # Main Dispatcher Function
