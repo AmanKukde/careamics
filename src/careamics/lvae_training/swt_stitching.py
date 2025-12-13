@@ -1,10 +1,12 @@
+
+import time
 import numpy as np
 from typing import Iterator, Union, List, Tuple
 from tqdm.notebook import tqdm
 import matplotlib.pyplot as plt
 import tifffile as tf
 import torch
-
+from pathlib import Path
 # ============================================================
 # Helper Utilities
 # ============================================================
@@ -321,21 +323,28 @@ def stitch_predictions_3d_gpu(
     
     # Pre-compute ALL patch locations
     num_patches = len(dset)
-    all_locs = torch.zeros((num_patches, 4), dtype=torch.long, device=device)
-    for i in range(num_patches):
-        loc = idx_manager.get_patch_location_from_dataset_idx(i)
-        all_locs[i] = torch.tensor(loc, device=device)
     
-    if debug:
-        print(f"[DEBUG] Pre-computed {num_patches} patch locations")
+
+    print("Computing all locations now...")
+    t1 = time.time()
+
+    LOC_PATH = Path("./patch_locations.pt")
+
+    if LOC_PATH.exists():
+        all_locs = torch.load(LOC_PATH).to(device)
+    else:
+        all_locs = torch.zeros((num_patches, 4), dtype=torch.long, device=device)
+        for i in range(num_patches):
+            all_locs[i] = torch.tensor(idx_manager.get_patch_location_from_dataset_idx(i), device=device)
+        torch.save(all_locs.cpu(), LOC_PATH)
     
     for batch_pred, batch_indices in generator:
         B = batch_pred.shape[0]
         batch_pred = _ensure_channel_last(batch_pred, is_3d=True).to(device).float()
         
         # Get locations for this batch
+
         locs = all_locs[batch_indices.long()]  # [B, 4]
-        
         # Crop all patches at once
         crops = batch_pred[:, cz0:cz0+zz, cy0:cy0+hh, cx0:cx0+ww, :]  # [B, zz, hh, ww, C]
         

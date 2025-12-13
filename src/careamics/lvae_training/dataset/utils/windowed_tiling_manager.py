@@ -108,7 +108,7 @@ class WindowedTilingGridIndexManager(GridIndexManager):
             self.n_patches_per_dim.append(num_patches)
 
             print(
-                f"  Dimension {i}: data={data_dim}, patch={patch_dim}, stride={stride_dim} "
+                f"  Dimension {i}: data={data_dim}, patch={patch_dim}, inner_tile={patch_dim//2}, stride={stride_dim} "
                 f"→ {num_patches} patches"
             )
 

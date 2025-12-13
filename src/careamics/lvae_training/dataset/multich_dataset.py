@@ -463,7 +463,7 @@ class MultiChDloader:
             v = max(1, grid_size // 8)
             return (v, v)
         # 3D: (Z, H, W)
-        return (4,8,8) #!@AMAN HARDCODED: Should pass in config
+        return (1,16,16) #!@AMAN HARDCODED: Should pass in config
         # return tuple(max(1, g // 4) for g in grid_size)
             
     def set_img_sz(self, image_size, grid_size: Union[int, Tuple[int, int, int]]):
