@@ -23,6 +23,7 @@ from careamics.lightning import VAEModule
 from careamics.lvae_training.dataset import MultiChDloaderRef
 from careamics.utils.metrics import scale_invariant_psnr
 import numpy as np
+from swt_stitching import *
 
 class TilingMode:
     """
@@ -476,7 +477,6 @@ def plot_error(target, prediction, cmap=matplotlib.cm.coolwarm, ax=None, max_val
 
 # -------------------------------------------------------------------------------------
 
-
 def get_predictions(
     model: VAEModule,
     dset: Dataset,
@@ -485,9 +485,11 @@ def get_predictions(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
-) -> tuple[dict, dict, dict]:
+    use_gpu_stitching: bool = True,
+    inner_fraction: float = 0.5,
+) -> tuple[dict, dict]:
     """Get patch-wise predictions from a model for the entire dataset.
-
+    
     Parameters
     ----------
     model : VAEModule
@@ -496,23 +498,26 @@ def get_predictions(
         Dataset to predict on.
     batch_size : int
         Batch size to use for prediction.
-    loss_type :
-        Type of reconstruction loss used by the model, by default `None`.
+    tile_size : tuple[int, int], optional
+        Size of tiles for prediction.
+    grid_size : int, optional
+        Grid size for tiling.
     mmse_count : int, optional
         Number of samples to generate for each input and then to average over for
         MMSE estimation, by default 1.
     num_workers : int, optional
         Number of workers to use for DataLoader, by default 4.
-
+    use_gpu_stitching : bool, optional
+        Whether to use GPU-based stitching, by default True.
+    inner_fraction : float, optional
+        Fraction of inner tile to use for blending, by default 0.5.
+        
     Returns
     -------
-    tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[float]]
+    tuple[dict, dict]
         Tuple containing:
-            - predictions: Predicted images for the dataset.
-            - predictions_std: Standard deviation of the predicted images.
-            - logvar_arr: Log variance of the predicted images.
-            - losses: Reconstruction losses for the predictions.
-            - psnr: PSNR values for the predictions.
+            - multifile_stitched_predictions: Dict of predicted images by filename.
+            - multifile_stitched_stds: Dict of standard deviations by filename.
     """
     if hasattr(dset, "dsets"):
         multifile_stitched_predictions = {}
@@ -526,6 +531,8 @@ def get_predictions(
                 grid_size=grid_size,
                 mmse_count=mmse_count,
                 num_workers=num_workers,
+                use_gpu_stitching=use_gpu_stitching,
+                inner_fraction=inner_fraction,
             )
             # get filename without extension and path
             filename = d._fpath.name
@@ -544,16 +551,16 @@ def get_predictions(
             grid_size=grid_size,
             mmse_count=mmse_count,
             num_workers=num_workers,
+            use_gpu_stitching=use_gpu_stitching,
+            inner_fraction=inner_fraction,
         )
-        # TODO stitching still not working properly for weirdly shaped images
         # get filename without extension and path
-        # TODO in the ref ds this is the name of a folder not file :(
         filename = dset._fpath.name
         return (
             {filename: stitched_predictions},
             {filename: stitched_stds},
         )
-
+    
 
 def get_single_file_predictions(
     model: VAEModule,
@@ -602,7 +609,6 @@ def get_single_file_predictions(
     tile_samples = np.concatenate(tiles, axis=0)
     return stitch_predictions_new(tile_samples, dset)
 
-
 def get_single_file_mmse(
     model: VAEModule,
     dset: Dataset,
@@ -611,140 +617,117 @@ def get_single_file_mmse(
     grid_size: Optional[int] = None,
     mmse_count: int = 1,
     num_workers: int = 4,
+    use_gpu_stitching: bool = True,
+    inner_fraction: float = 0.5,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Get patch-wise predictions from a model for a single file dataset."""
     device = get_device()
-
     dloader = DataLoader(
         dset,
-        pin_memory=False,
+        pin_memory=True if use_gpu_stitching else False,
         num_workers=num_workers,
         shuffle=False,
         batch_size=batch_size,
     )
+    
     if tile_size and grid_size:
         dset.set_img_sz(tile_size, grid_size)
-
+    
     model.eval()
     model.to(device)
-    tile_mmse = []
-    tile_stds = []
-    logvar_arr = []
-    with torch.no_grad():
-        for batch in tqdm(dloader, desc="Predicting tiles"):
-            inp, tar = batch
-            inp = inp.to(device)
-            tar = tar.to(device)
-
-            rec_img_list = []
-            for _ in range(mmse_count):
-
-                # get model output
-                rec, _ = model(inp)
-
-                # get reconstructed img
-                if model.model.predict_logvar is None:
-                    rec_img = rec
-                    logvar = torch.tensor([-1])
-                else:
-                    rec_img, logvar = torch.chunk(rec, chunks=2, dim=1)
-                rec_img_list.append(rec_img.cpu().unsqueeze(0))  # add MMSE dim
-                logvar_arr.append(logvar.cpu().numpy())  # Why do we need this ?
-
-            # aggregate results
-            samples = torch.cat(rec_img_list, dim=0)
-            mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
-            std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
-
-            tile_mmse.append(mmse_imgs.cpu().numpy())
-            tile_stds.append(std_imgs.cpu().numpy())
-
-    tiles_arr = np.concatenate(tile_mmse, axis=0)
-    tile_stds = np.concatenate(tile_stds, axis=0)
-    # TODO temporary hack, because of the stupid jupyter!
-    # If a user reruns a cell with class definition, isinstance will return False
-    if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
-        stitch_func = stitch_predictions_general
+    
+    if use_gpu_stitching:
+        # GPU-based stitching: keep everything on GPU
+        tile_mmse = []
+        tile_stds = []
+        tile_indices = []
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(dloader, desc="Predicting tiles")):
+                inp, tar = batch
+                inp = inp.to(device)
+                tar = tar.to(device)
+                
+                rec_img_list = []
+                for _ in range(mmse_count):
+                    # get model output
+                    rec, _ = model(inp)
+                    # get reconstructed img
+                    if model.model.predict_logvar is None:
+                        rec_img = rec
+                    else:
+                        rec_img, logvar = torch.chunk(rec, chunks=2, dim=1)
+                    rec_img_list.append(rec_img.unsqueeze(0))  # add MMSE dim, keep on GPU
+                
+                # aggregate results
+                samples = torch.cat(rec_img_list, dim=0)
+                mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
+                std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
+                
+                tile_mmse.append(mmse_imgs)  # Keep on GPU
+                tile_stds.append(std_imgs)  # Keep on GPU
+                
+                # Track which tiles these are
+                batch_start_idx = batch_idx * batch_size
+                batch_end_idx = min(batch_start_idx + batch_size, len(dset))
+                tile_indices.extend(range(batch_start_idx, batch_end_idx))
+        
+        # Concatenate on GPU
+        tiles_tensor = torch.cat(tile_mmse, dim=0)  # [N, C, *spatial]
+        stds_tensor = torch.cat(tile_stds, dim=0)  # [N, C, *spatial]
+        
+        # GPU stitching
+        stitched_predictions = stitch_predictions_gpu(
+            tiles_tensor, dset, inner_fraction=inner_fraction, device=device
+        )
+        stitched_stds = stitch_predictions_gpu(
+            stds_tensor, dset, inner_fraction=inner_fraction, device=device
+        )
+        
+        # Convert to numpy for compatibility
+        stitched_predictions = stitched_predictions.cpu().numpy()
+        stitched_stds = stitched_stds.cpu().numpy()
+        
     else:
-        stitch_func = stitch_predictions_new
-    stitched_predictions = stitch_func(tiles_arr, dset)
-    stitched_stds = stitch_func(tile_stds, dset)
+        # Original CPU-based approach
+        tile_mmse = []
+        tile_stds = []
+        
+        with torch.no_grad():
+            for batch in tqdm(dloader, desc="Predicting tiles"):
+                inp, tar = batch
+                inp = inp.to(device)
+                tar = tar.to(device)
+                
+                rec_img_list = []
+                for _ in range(mmse_count):
+                    rec, _ = model(inp)
+                    if model.model.predict_logvar is None:
+                        rec_img = rec
+                    else:
+                        rec_img, logvar = torch.chunk(rec, chunks=2, dim=1)
+                    rec_img_list.append(rec_img.cpu().unsqueeze(0))
+                
+                samples = torch.cat(rec_img_list, dim=0)
+                mmse_imgs = torch.mean(samples, dim=0)
+                std_imgs = torch.std(samples, dim=0)
+                
+                tile_mmse.append(mmse_imgs.cpu().numpy())
+                tile_stds.append(std_imgs.cpu().numpy())
+        
+        tiles_arr = np.concatenate(tile_mmse, axis=0)
+        tile_stds = np.concatenate(tile_stds, axis=0)
+        
+        # Use appropriate stitching function
+        if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
+            stitch_func = stitch_predictions_general
+        else:
+            stitch_func = stitch_predictions_new
+        
+        stitched_predictions = stitch_func(tiles_arr, dset)
+        stitched_stds = stitch_func(tile_stds, dset)
+    
     return stitched_predictions, stitched_stds
-
-# def get_single_file_mmse_usplit(
-#     model: VAEModule,
-#     dset: Dataset,
-#     batch_size: int,
-#     tile_size: Optional[tuple[int, int]] = None,
-#     grid_size: Optional[int] = None,
-#     mmse_count: int = 1,
-#     num_workers: int = 4,
-#     sliding_window_flag = False,
-# ) -> tuple[np.ndarray, np.ndarray]:
-#     """Get patch-wise predictions from a model for a single file dataset."""
-#     device = get_device()
-
-#     dloader = DataLoader(
-#         dset,
-#         pin_memory=False,
-#         num_workers=num_workers,
-#         shuffle=False,
-#         batch_size=batch_size,
-#     )
-#     # if tile_size and grid_size:
-#     #     dset.set_img_sz(tile_size, grid_size)
-
-#     model.eval()
-#     model.to(device)
-#     tile_mmse = []
-#     tile_stds = []
-#     # logvar_arr = []
-#     with torch.no_grad():
-#         for batch in tqdm(dloader, desc="Predicting tiles"):
-#             inp, tar = batch
-#             inp = inp.to(device)
-#             tar = tar.to(device)
-
-#             rec_img_list = []
-#             for _ in range(mmse_count):
-#                 # get model output
-#                 rec, _ = model(inp)
-#                 rec = get_img_from_forward_output(rec,model) 
-#                 # get reconstructed img
-#                 # 
-#                 rec_img_list.append(rec.cpu().unsqueeze(0))  # add MMSE dim
-
-#             # aggregate results
-#             # 
-#             samples = torch.cat(rec_img_list, dim=0)
-#             mmse_imgs = torch.mean(samples, dim=0)  # avg over MMSE dim
-#             std_imgs = torch.std(samples, dim=0)  # std over MMSE dim
-
-#             tile_mmse.append(mmse_imgs.cpu().numpy())
-#             tile_stds.append(std_imgs.cpu().numpy())
-
-#     tiles_arr = np.concatenate(tile_mmse, axis=0)
-#     tile_stds = np.concatenate(tile_stds, axis=0)
-#     # TODO temporary hack, because of the stupid jupyter!
-    
-#     # If a user reruns a cell with class definition, isinstance will return False
-#     if str(MultiChDloaderRef).split(".")[-1] == str(dset.__class__).split(".")[-1]:
-#         stitch_func = stitch_predictions_general
-#     else:
-#         stitch_func = stitch_predictions_new
-#     if sliding_window_flag:
-#         stitch_func = stitch_and_crop_predictions_inner_tile
-    
-#     print(f"Using {stitch_func}")
-
-#     if sliding_window_flag:
-#         stitched_predictions, counts_matrix_for_stitched_predictions = stitch_func(tiles_arr, dset)
-#         stitched_stds, counts_matrix_for_stitched_stds = stitch_func(tile_stds, dset)
-#         return stitched_predictions, stitched_stds, counts_matrix_for_stitched_predictions, counts_matrix_for_stitched_stds
-#     stitched_predictions = stitch_func(tiles_arr, dset)
-#     stitched_stds = stitch_func(tile_stds, dset)
-#     return stitched_predictions, stitched_stds
-
 # # ------------------------------------------------------------------------------------------
 ### Classes and Functions used to stitch predictions
 class PatchLocation:
