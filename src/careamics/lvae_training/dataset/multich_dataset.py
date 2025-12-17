@@ -216,6 +216,18 @@ class MultiChDloader:
                     self.explicit_pad_width = ((0,0), (0,0), (32,32), (32,32), (0,0))
             self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
             print("padded data !")
+        
+        if data_config.data_type == DataType.Care3D:
+            if self.sliding_window_flag:
+                self.explicit_pad_width = ((0,0), (7,7), (48,48), (48,48), (0,0))
+            else:
+                if "mode" == "IT":
+                    self.explicit_pad_width = ((0,0), (0,0), (16,16), (16,16), (0,0))
+                else:
+                    self.explicit_pad_width = ((0,0), (0,0), (32,32), (32,32), (0,0))
+            self._data = self.reflect_pad(self._data, pad_width=self.explicit_pad_width)
+            print(f"padded data with {self.explicit_pad_width}")
+
         self._loaded_data_preprocessing(data_config)
 
     def reflect_pad(self, arr, pad_width=None):
@@ -414,6 +426,10 @@ class MultiChDloader:
                 self._noise_data = self._noise_data[
                     t_list, z_start:z_end, h_start:h_end, w_start:w_end, :
                 ].copy()
+            self.set_img_sz([z_end - z_start,self._img_sz, self._img_sz], self._grid_sz)
+            print(
+                f"[{self.__class__.__name__}] Data reduced. New data shape: {self._data.shape}"
+            )
         else:
             if t_list is None:
                 t_list = list(range(self._data.shape[0]))
@@ -432,10 +448,10 @@ class MultiChDloader:
                     t_list, h_start:h_end, w_start:w_end, :
                 ].copy()
         # TODO where tf is self._img_sz defined?
-        self.set_img_sz([self._img_sz, self._img_sz], self._grid_sz)
-        print(
-            f"[{self.__class__.__name__}] Data reduced. New data shape: {self._data.shape}"
-        )
+            self.set_img_sz([self._img_sz, self._img_sz], self._grid_sz)
+            print(
+                f"[{self.__class__.__name__}] Data reduced. New data shape: {self._data.shape}"
+            )
 
     def get_idx_manager_shapes(
         self, patch_size: int, grid_size: Union[int, Tuple[int, int, int]]
@@ -513,6 +529,35 @@ class MultiChDloader:
                 shape, grid_shape, patch_shape, self._tiling_mode
             )
         # self.set_repeat_factor()
+    def get_idx_manager_shapes(
+        self, patch_size: int, grid_size: Union[int, Tuple[int, int, int]]
+    ):
+        numC = self._data.shape[-1]
+        if self._5Ddata:
+            patch_shape = (1, self._depth3D, patch_size, patch_size, numC)
+            if isinstance(grid_size, int):
+                grid_shape = (1, 1, grid_size, grid_size, numC)
+            else:
+                assert len(grid_size) == 3
+                assert all(
+                    [g <= p for g, p in zip(grid_size, patch_shape[1:-1])]
+                ), f"Grid size {grid_size} must be less than patch size {patch_shape[1:-1]}"
+                grid_shape = (1, grid_size[0], grid_size[1], grid_size[2], numC)
+        else:
+            assert isinstance(grid_size, int)
+            grid_shape = (1, grid_size, grid_size, numC)
+            patch_shape = (1, patch_size, patch_size, numC)
+
+        return patch_shape, grid_shape
+    
+    
+    def get_stride(self,grid_size: Union[int, Tuple[int, int, int]]):
+        if isinstance(grid_size, int):            # 2D
+            v = max(1, grid_size // 8)
+            return (v, v)
+        # 3D: (Z, H, W)
+        return (1,16,16) #!@AMAN HARDCODED: Should pass in config
+        # return tuple(max(1, g // 4) for g in grid_size)
 
     def __len__(self):
         if hasattr(self, 'idx_manager') and hasattr(self.idx_manager, 'total_patch_count'):

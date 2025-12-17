@@ -320,7 +320,7 @@ def stitch_predictions_3d_gpu(
     
     cz0, cy0, cx0 = start_inners
     zz, hh, ww = inner_tile_sizes
-    
+    print("Inner Tile Sizes:", inner_tile_sizes)
     # Pre-compute ALL patch locations
     num_patches = len(dset)
     
@@ -329,14 +329,17 @@ def stitch_predictions_3d_gpu(
     t1 = time.time()
 
     LOC_PATH = Path("./patch_locations.pt")
-
-    if LOC_PATH.exists():
+    # if LOC_PATH.exists():
+    if 0:
         all_locs = torch.load(LOC_PATH).to(device)
+        print("Loaded locations from path")
     else:
         all_locs = torch.zeros((num_patches, 4), dtype=torch.long, device=device)
         for i in range(num_patches):
             all_locs[i] = torch.tensor(idx_manager.get_patch_location_from_dataset_idx(i), device=device)
         torch.save(all_locs.cpu(), LOC_PATH)
+    print(f"Precomputed all Locations in {time.time() - t1} secs")
+    
     
     for batch_pred, batch_indices in generator:
         B = batch_pred.shape[0]
